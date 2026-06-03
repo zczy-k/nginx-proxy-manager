@@ -806,9 +806,7 @@ run_install() {
     health_check
 
     spacer
-    echo -e "  ${YELLOW}管理:${NC} ${BOLD}bash deploy/setup.sh${NC}"
-    echo -e "  ${YELLOW}升级:${NC} ${BOLD}bash deploy/setup.sh upgrade${NC}"
-    echo -e "  ${YELLOW}卸载:${NC} ${BOLD}bash deploy/setup.sh uninstall${NC}"
+    echo -e "  ${YELLOW}再次运行:${NC} ${BOLD}bash deploy/setup.sh${NC}  进入交互菜单"
     spacer
 }
 
@@ -873,21 +871,10 @@ main_menu() {
 
 handle_args() {
     case "${1:-}" in
-        install)   check_root; run_install ;;
-        reinstall) check_root; cleanup_old_install true; run_install ;;
-        uninstall) check_root; uninstall_npm ;;
-        upgrade)   check_root; upgrade_npm ;;
-        health|check)  health_check ;;
-        status)    show_status ;;
         --help|-h)
-            echo -e "${BOLD}用法:${NC} bash deploy/setup.sh [命令]"
-            echo -e "  (无参数)    交互式菜单"
-            echo -e "  install     安装（引导式）"
-            echo -e "  reinstall   强制重装（先清除所有）"
-            echo -e "  uninstall   卸载"
-            echo -e "  upgrade     升级"
-            echo -e "  health      健康检查"
-            echo -e "  status      查看状态"
+            echo -e "${CYAN}Nginx Proxy Manager - Bare-Metal 部署工具${NC}"
+            echo -e "  ${DIM}用法:${NC} ${BOLD}bash deploy/setup.sh${NC}"
+            echo -e "  ${DIM}说明:${NC}  运行后显示交互式菜单，所有操作通过菜单完成${NC}"
             ;;
         *) main_menu ;;
     esac

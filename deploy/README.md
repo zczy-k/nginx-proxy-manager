@@ -5,26 +5,14 @@
 ## 快速开始
 
 ```bash
-# 1. 克隆本仓库到服务器
+# 克隆本仓库到服务器
 git clone --depth 1 https://github.com/zczy-k/nginx-proxy-manager.git /opt/nginx-proxy-manager
 
-# 2. 运行部署脚本
-sudo bash /opt/nginx-proxy-manager/deploy/setup.sh
-
-# 或直接安装
-sudo bash /opt/nginx-proxy-manager/deploy/setup.sh install
+# 进入目录并运行脚本
+cd /opt/nginx-proxy-manager && sudo bash deploy/setup.sh
 ```
 
-## 命令
-
-| 命令 | 说明 |
-|------|------|
-| `bash deploy/setup.sh` | 交互式菜单 |
-| `bash deploy/setup.sh install` | 安装 NPM |
-| `bash deploy/setup.sh uninstall` | 卸载 NPM |
-| `bash deploy/setup.sh upgrade` | 升级 NPM |
-| `bash deploy/setup.sh health` | 健康检查 |
-| `bash deploy/setup.sh status` | 查看状态 |
+> 直接运行 `sudo bash deploy/setup.sh` 即可进入交互式菜单，所有操作通过菜单选择完成。
 
 ## 特性
 
