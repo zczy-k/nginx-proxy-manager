@@ -16,9 +16,10 @@ NPM_DIR="/opt/nginx-proxy-manager"
 SCRIPT_DIR="$NPM_DIR/deploy"
 NPM_USER="npm"; NPM_GROUP="npm"
 DATA_DIR="/data/npm"; LOG_DIR="/var/log/npm"
-BACKUP_DIR="/tmp/npm-backup-$(date +%s)"
+NGINX_DATA_DIR="/data/nginx"
+BACKUP_DIR="/var/backups/npm-$(date +%s)"
 NGINX_CONF_DIR="/etc/nginx/npm-conf.d"
-NODE_VERSION="22"; SCRIPT_VERSION="2.0.0"
+NODE_VERSION="22"; SCRIPT_VERSION="2.1.0"
 LOG_FILE="/var/log/npm-setup.log"
 ENV_FILE="$NPM_DIR/.env"
 UPSTREAM_REPO="https://github.com/NginxProxyManager/nginx-proxy-manager.git"
@@ -37,7 +38,11 @@ if [[ ! -f "$SCRIPT_DIR/setup.sh" ]]; then
     rm -rf "$NPM_DIR" 2>/dev/null || true
     git clone --depth 1 "$GIT_REPO" "$NPM_DIR"
     echo "==> 仓库克隆完成，启动部署工具..."
-    exec sudo bash "$SCRIPT_DIR/setup.sh" "$@"
+    if [[ $EUID -eq 0 ]]; then
+        exec bash "$SCRIPT_DIR/setup.sh" "$@"
+    else
+        exec sudo bash "$SCRIPT_DIR/setup.sh" "$@"
+    fi
 fi
 
 # ─── 辅助函数 ─────────────────────────────────────────────
@@ -104,7 +109,8 @@ show_firewall_hint() {
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        error "请以 root 身份运行: sudo bash $0"
+        local script="${BASH_SOURCE[0]:-$0}"
+        error "请以 root 身份运行: sudo bash $script"
         exit 1
     fi
 }
@@ -124,8 +130,12 @@ print_banner() {
 confirm() {
     local prompt=$1; local default=${2:-n}; local yn
     [[ "$default" == "y" ]] && prompt="$prompt [Y/n]" || prompt="$prompt [y/N]"
-    read -r -p "$(echo -e "${YELLOW}?${NC} $prompt ")" yn
-    case "$yn" in [Yy]*) return 0;; [Nn]*) return 1;; "") [[ "$default" == "y" ]];;
+    read -r -p "$(echo -e "${YELLOW}?${NC} $prompt ")" yn || yn=""
+    case "$yn" in
+        [Yy]*) return 0;;
+        [Nn]*) return 1;;
+        "") [[ "$default" == "y" ]];;
+        *) warn "请输入 y 或 n (默认: $default)"; confirm "$1" "$2";;
     esac
 }
 
@@ -252,16 +262,24 @@ resolve_port_conflicts() {
     local ports=($PORT_HTTP $PORT_HTTPS $PORT_ADMIN $PORT_BACKEND)
     local resolved=false; local seen=()
     section "端口冲突自动解决"
+    warn "自动停用占用进程将影响该服务提供的所有功能，请确认"
+    if ! confirm "确认要自动停用占用进程？" "n"; then
+        info "已取消，请手动调整端口或停止占用服务"; return 1
+    fi
     for port in "${ports[@]}"; do
         [[ " ${seen[*]} " =~ " $port " ]] && continue; seen+=("$port")
         local pid; pid=$(ss -tlnp "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1 || true)
         [[ -z "$pid" ]] && continue
-        local unit; unit=$(systemctl status "$pid" 2>/dev/null | grep -oP '● \K[^. ]+' | head -1 || true)
+        local unit
+        unit=$(systemctl status "$pid" 2>/dev/null | grep -oP '● \K[^. ]+' | head -1 || true)
         if [[ -n "$unit" ]]; then
-            systemctl stop "$unit" 2>/dev/null || true; systemctl disable "$unit" 2>/dev/null || true
+            # 补全 .service 后缀（旧版 systemd 不自动补全）
+            [[ "$unit" != *.* ]] && unit="${unit}.service"
+            systemctl stop "$unit" 2>/dev/null || true
+            systemctl disable "$unit" 2>/dev/null || true
             resolved=true; log "已停用 $unit，释放端口 $port"
         else
-            warn "端口 $port 无法自动释放 (PID:$pid)"
+            warn "端口 $port 无法自动释放 (PID:$pid) - 可能不是 systemd 管理的进程"
         fi
     done
     $resolved && return 0 || return 1
@@ -318,7 +336,9 @@ cleanup_old_install() {
 
 install_deps() {
     section "安装系统依赖"
-    apt-get update -qq && apt-get install -y --no-install-recommends \
+    apt-get update -qq
+    # 系统包推荐安装 (包括 certbot 所需的推荐依赖)
+    apt-get install -y \
         nginx certbot python3 python3-certbot-nginx \
         git curl jq logrotate ca-certificates sqlite3 lsof > /dev/null
     log "系统依赖安装完成"
@@ -328,17 +348,25 @@ install_nodejs() {
     section "安装 Node.js $NODE_VERSION"
     if command -v node &>/dev/null; then
         local ver; ver=$(node --version)
-        [[ "$ver" =~ v([0-9]+) ]] && [[ "${BASH_REMATCH[1]}" -ge 18 ]] && log "Node.js $ver ✓" && return
-        info "升级到 $NODE_VERSION ..."
+        if [[ "$ver" =~ v([0-9]+) ]] && [[ "${BASH_REMATCH[1]}" -ge 18 ]]; then
+            log "Node.js $ver ✓"; return
+        fi
+        info "当前 $ver，升级到 $NODE_VERSION ..."
     fi
-    curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | bash -
-    apt-get install -y nodejs > /dev/null; log "Node.js $(node --version) 安装完成"
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | bash - > /dev/null
+    apt-get update -qq > /dev/null
+    apt-get install -y nodejs > /dev/null
+    log "Node.js $(node --version) 安装完成"
 }
 
 create_user() {
     section "创建运行用户"
     id -u "$NPM_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin -d "$NPM_DIR" "$NPM_USER"
-    info "用户 $NPM_USER ✓"
+    # 确保 NPM_DIR 下所有文件归 NPM_USER 所有（用户用 root git clone 后会产生 root-owned 文件）
+    if [[ -d "$NPM_DIR" ]]; then
+        chown -R "$NPM_USER:$NPM_GROUP" "$NPM_DIR" 2>/dev/null || true
+    fi
+    info "用户 $NPM_USER ✓ (权限已调整)"
 }
 
 install_node_deps() {
@@ -348,10 +376,11 @@ install_node_deps() {
     local pid=$!; echo -ne "${DIM}  安装中 ...${NC}"
     while kill -0 "$pid" 2>/dev/null; do echo -n "."; sleep 1; done
     echo -e " ${GREEN}done${NC}"
-    wait "$pid"
+    wait "$pid" || { error "npm install 失败"; return 1; }
 
     if confirm "移除 MySQL/PostgreSQL 驱动以节省内存？" "y"; then
-        npm uninstall mysql2 pg sqlite3 2>/dev/null || true; log "已移除多余 DB 驱动"
+        su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm uninstall mysql2 pg sqlite3 --no-audit --no-fund" 2>/dev/null || true
+        log "已移除多余 DB 驱动"
     fi
 
     # ─── 后端端口 patch ───────────────────────────────────
@@ -361,15 +390,65 @@ install_node_deps() {
     fi
 }
 
+build_frontend() {
+    section "构建前端 (管理面板 UI)"
+
+    if [[ -d "$NPM_DIR/frontend/dist" ]] && [[ -f "$NPM_DIR/frontend/dist/index.html" ]]; then
+        info "前端已构建 (跳过)"; return 0
+    fi
+
+    if [[ "${SKIP_FRONTEND_BUILD:-}" == "1" ]]; then
+        warn "已跳过前端构建 (SKIP_FRONTEND_BUILD=1)"
+        warn "管理后台将无法访问，需手动: cd $NPM_DIR/frontend && npm install && npm run build"
+        return 0
+    fi
+
+    cd "$NPM_DIR/frontend"
+    info "正在安装前端依赖 (yarn/npm) ..."
+    su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/frontend' && npm install --no-audit --no-fund" &
+    local pid=$!; echo -ne "${DIM}  安装中 ...${NC}"
+    while kill -0 "$pid" 2>/dev/null; do echo -n "."; sleep 2; done
+    echo -e " ${GREEN}done${NC}"
+    wait "$pid" || { error "前端依赖安装失败"; return 1; }
+
+    info "正在构建前端 (TypeScript + Vite) ..."
+    su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/frontend' && npm run build" 2>&1 | tail -20 || {
+        error "前端构建失败"; return 1;
+    }
+
+    if [[ ! -f "$NPM_DIR/frontend/dist/index.html" ]]; then
+        error "前端构建未生成 dist/index.html"; return 1
+    fi
+    log "前端已构建 → $NPM_DIR/frontend/dist"
+}
+
 configure_nginx() {
     section "配置 Nginx 隔离环境"
     # 备份
-    mkdir -p "$BACKUP_DIR"; [[ -d /etc/nginx ]] && cp -r /etc/nginx "$BACKUP_DIR/nginx-backup" && log "Nginx 已备份"
+    mkdir -p "$BACKUP_DIR"; [[ -d /etc/nginx ]] && cp -r /etc/nginx "$BACKUP_DIR/nginx-backup" && log "Nginx 已备份到 $BACKUP_DIR"
+
+    # 前端文件检测
+    if [[ ! -f "$NPM_DIR/frontend/dist/index.html" ]]; then
+        warn "前端 dist/index.html 不存在，管理后台将无法访问"
+        warn "请运行: cd $NPM_DIR/frontend && npm install && npm run build"
+        if ! confirm "仍要继续配置 Nginx？" "n"; then
+            error "已取消，请先构建前端"; return 1
+        fi
+        # 创建占位文件避免 Nginx 启动失败
+        mkdir -p "$NPM_DIR/frontend/dist"
+        cat > "$NPM_DIR/frontend/dist/index.html" <<'EOF'
+<!DOCTYPE html>
+<html><head><title>NPM - Frontend Not Built</title></head>
+<body><h1>Frontend not built</h1><p>Run: cd /opt/nginx-proxy-manager/frontend && npm install && npm run build</p></body>
+</html>
+EOF
+    fi
 
     mkdir -p "$NGINX_CONF_DIR"
     cat > "$NGINX_CONF_DIR/npm-admin.conf" << NGINX_CONF
 server {
     listen ${PORT_ADMIN};
+    listen [::]:${PORT_ADMIN};
     server_name _;
     charset utf-8;
     access_log /var/log/npm/admin-access.log;
@@ -409,35 +488,45 @@ server {
 NGINX_CONF
     log "Nginx 管理面板配置已生成 (端口 $PORT_ADMIN → backend:$PORT_BACKEND)"
 
-    mkdir -p /data/nginx/{custom,proxy_host,redirection_host,stream,dead_host,temp}
-    chown -R "$NPM_USER:$NPM_GROUP" /data/nginx
+    mkdir -p "$NGINX_DATA_DIR"/{custom,proxy_host,redirection_host,stream,dead_host,temp}
+    chown -R "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR"
 
     local nginx_conf="/etc/nginx/nginx.conf"
     if [[ -f "$nginx_conf" ]] && ! grep -q "npm-conf.d" "$nginx_conf" 2>/dev/null; then
         sed -i '/^http {/a\    include /etc/nginx/npm-conf.d/*.conf;' "$nginx_conf"
-        sed -i '/^http {/a\    include /data/nginx/custom/http_top.conf;' "$nginx_conf"
+        if ! grep -q "${NGINX_DATA_DIR}/custom/http_top.conf" "$nginx_conf" 2>/dev/null; then
+            sed -i '/^http {/a\    include '"${NGINX_DATA_DIR}"'/custom/http_top.conf;' "$nginx_conf"
+        fi
         log "已向 nginx.conf 注入 NPM include"
     fi
 
     if nginx -t 2>/dev/null; then
-        systemctl reload nginx; log "Nginx 重载成功"
+        systemctl reload nginx 2>/dev/null && log "Nginx 重载成功" || warn "Nginx reload 失败，请手动检查"
     else
         warn "Nginx 测试失败，恢复备份..."
-        cp -r "$BACKUP_DIR/nginx-backup"/* /etc/nginx/ 2>/dev/null || true
-        systemctl reload nginx 2>/dev/null || true
+        if [[ -d "$BACKUP_DIR/nginx-backup" ]]; then
+            cp -r "$BACKUP_DIR/nginx-backup"/* /etc/nginx/ 2>/dev/null || true
+            systemctl reload nginx 2>/dev/null || true
+        fi
         error "请手动检查 nginx -t"
+        return 1
     fi
 }
 
 create_data_dirs() {
     section "创建数据目录"
+    # 确保父目录存在并设置正确权限
+    mkdir -p "$(dirname "$DATA_DIR")" "$(dirname "$NGINX_DATA_DIR")" "$(dirname "$LOG_DIR")"
     mkdir -p "$DATA_DIR" "$LOG_DIR"
-    chown -R "$NPM_USER:$NPM_GROUP" "$DATA_DIR" "$LOG_DIR"
+    chown -R "$NPM_USER:$NPM_GROUP" "$DATA_DIR" "$LOG_DIR" 2>/dev/null || \
+        warn "无法修改 $DATA_DIR 权限，可能已被挂载"
     log "数据: $DATA_DIR | 日志: $LOG_DIR"
 }
 
 create_systemd_service() {
     section "创建 systemd 服务"
+    local node_bin
+    node_bin=$(command -v node || echo "/usr/bin/node")
     cat > /etc/systemd/system/npm-backend.service << SERVICE
 [Unit]
 Description=Nginx Proxy Manager Backend
@@ -455,7 +544,7 @@ Environment=NODE_ENV=production
 Environment=DB_SQLITE_FILE=${DATA_DIR}/database.sqlite
 Environment=DISABLE_IPV6=true
 Environment=IP_RANGES_FETCH_ENABLED=false
-ExecStart=/usr/bin/node index.js
+ExecStart=${node_bin} index.js
 ExecReload=/bin/kill -SIGTERM \$MAINPID
 Restart=on-failure
 RestartSec=5
@@ -472,7 +561,7 @@ ProtectControlGroups=true
 WantedBy=multi-user.target
 SERVICE
 
-    systemctl daemon-reload; log "Systemd 服务已创建"
+    systemctl daemon-reload; log "Systemd 服务已创建 (node: $node_bin)"
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -514,13 +603,19 @@ health_check() {
         fi
     done
 
-    # 4. HTTP 响应 (管理后台)
+    # 4. HTTP 响应 (管理后台) - 检查状态码 + 内容
     echo -ne "  ${BOLD}[HTTP]${NC} :$PORT_ADMIN "
-    local http_code
+    local http_body http_code
+    http_body=$(curl -s --connect-timeout 5 "http://127.0.0.1:$PORT_ADMIN" 2>/dev/null || echo "")
     http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 \
         "http://127.0.0.1:$PORT_ADMIN" 2>/dev/null || echo "000")
     if [[ "$http_code" == "200" || "$http_code" == "302" || "$http_code" == "301" ]]; then
-        echo -e "${GREEN}${http_code}${NC}"
+        # 二次验证: 响应内容应包含 NPM 标识
+        if echo "$http_body" | grep -qi "nginx\|proxy.manager\|<title>"; then
+            echo -e "${GREEN}${http_code} (内容有效)${NC}"
+        else
+            echo -e "${YELLOW}${http_code} (内容异常)${NC}"; all_pass=false
+        fi
     else
         echo -e "${RED}${http_code}${NC}"; all_pass=false
     fi
@@ -658,8 +753,9 @@ upgrade_npm() {
     if [[ -d "$NPM_DIR/frontend" ]]; then
         if confirm "重新构建前端？" "y"; then
             cd "$NPM_DIR/frontend"
-            npm install --no-audit --no-fund 2>/dev/null || true
-            npm run build 2>/dev/null && log "前端构建完成" || warn "前端构建失败"
+            su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/frontend' && npm install --no-audit --no-fund" 2>/dev/null || true
+            su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/frontend' && npm run build" 2>&1 | tail -10 && \
+                log "前端构建完成" || warn "前端构建失败"
         fi
     fi
 
@@ -804,6 +900,7 @@ run_install() {
 
     # 自动补齐缺失的系统依赖和 Node.js
     install_deps; install_nodejs; create_user; install_node_deps
+    build_frontend
     configure_nginx; create_data_dirs; save_env
     create_systemd_service
 
