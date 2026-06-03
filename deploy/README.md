@@ -4,21 +4,17 @@
 
 ## 快速开始
 
-### 一行命令部署
-
+**一行命令（推荐）：**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zczy-k/nginx-proxy-manager/develop/deploy/setup.sh | sudo bash
+bash <(curl -fsSL https://raw.githubusercontent.com/zczy-k/nginx-proxy-manager/develop/deploy/setup.sh)
 ```
 
-> 脚本会自动克隆仓库到 `/opt/nginx-proxy-manager` 并启动交互菜单。
-> 此命令适用于 **全新服务器**，所有操作通过菜单数字选择完成。
-
-### 备用方式
-
+或者使用 git clone：
 ```bash
-git clone --depth 1 https://github.com/zczy-k/nginx-proxy-manager.git /opt/nginx-proxy-manager
-sudo bash /opt/nginx-proxy-manager/deploy/setup.sh
+git clone --depth 1 https://github.com/zczy-k/nginx-proxy-manager.git /opt/nginx-proxy-manager && sudo bash /opt/nginx-proxy-manager/deploy/setup.sh
 ```
+
+> 运行后进入交互式菜单，所有操作通过数字选择完成。
 
 ## 特性
 

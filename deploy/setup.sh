@@ -211,8 +211,10 @@ detect_arch() {
 }
 
 detect_existing_npm() {
-    if [[ -d "$NPM_DIR/backend" ]]; then warn "发现安装目录: $NPM_DIR"; return 0; fi
-    if systemctl is-enabled npm-backend &>/dev/null 2>&1; then warn "发现 npm-backend 服务"; return 0; fi
+    if systemctl is-enabled npm-backend &>/dev/null 2>&1; then warn "发现系统服务 (npm-backend)"; return 0; fi
+    if [[ -f /etc/systemd/system/npm-backend.service ]]; then warn "发现旧服务文件"; return 0; fi
+    if [[ -d "$NGINX_CONF_DIR" ]]; then warn "发现 Nginx 配置目录"; return 0; fi
+    if [[ -f "$DATA_DIR/database.sqlite" ]]; then warn "发现数据库文件"; return 0; fi
     if pgrep -f "node.*index.js" | grep -q "nginx-proxy-manager" 2>/dev/null; then warn "发现运行中的后端进程"; return 0; fi
     return 1
 }
@@ -282,13 +284,12 @@ cleanup_old_install() {
         cleaned=true; log "已清理 Docker 容器"
     fi
 
-    # 删除安装目录
-    for dir in "$NPM_DIR" "/app/nginx-proxy-manager"; do
-        if [[ -d "$dir" ]]; then
-            if $force; then rm -rf "$dir"; cleaned=true; log "已删除: $dir"
-            else confirm "删除目录 $dir？" "n" && rm -rf "$dir" && cleaned=true && log "已删除: $dir" || true; fi
-        fi
-    done
+    # 删除安装目录（仅强制模式）
+    if $force; then
+        for dir in "$NPM_DIR" "/app/nginx-proxy-manager"; do
+            [[ -d "$dir" ]] && rm -rf "$dir" && cleaned=true && log "已删除: $dir"
+        done
+    fi
 
     # 删除数据目录
     if [[ -d "$DATA_DIR" ]]; then
@@ -787,6 +788,20 @@ run_install() {
     spacer; confirm "确认开始安装？" "y" || exit 1
 
     spacer; header "开始安装"
+
+    # 确保 NPM 源码存在（清除旧安装后或首次运行）
+    if [[ ! -d "$NPM_DIR/backend" ]]; then
+        section "准备 NPM 源码"
+        info "未找到源码目录，正在克隆仓库 ..."
+        git clone --depth 1 -b develop "$GIT_REPO" "$NPM_DIR" 2>/dev/null || {
+            warn "克隆主仓库失败，尝试备用上游 ..."
+            git clone --depth 1 -b develop "$UPSTREAM_REPO" "$NPM_DIR" 2>/dev/null || {
+                error "克隆失败，请检查网络后重试"; exit 1
+            }
+        }
+        log "NPM 源码已就绪 ($NPM_DIR)"
+    fi
+
     # 自动补齐缺失的系统依赖和 Node.js
     install_deps; install_nodejs; create_user; install_node_deps
     configure_nginx; create_data_dirs; save_env
