@@ -1,0 +1,769 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════
+# Nginx Proxy Manager - Bare-Metal 部署工具
+# 适用: Ubuntu 20.04+ / Debian 11+ | 2C1G 低配服务器
+# 特性: 交互式菜单 | 端口自定义 | 升级管理 | 健康检查
+# ═══════════════════════════════════════════════════════════════
+set -euo pipefail
+
+# ─── 颜色 ─────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'
+BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+# ─── 路径 (基于脚本位置自动推导) ──────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NPM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"  # 仓库根目录
+NPM_USER="npm"; NPM_GROUP="npm"
+DATA_DIR="/data/npm"; LOG_DIR="/var/log/npm"
+BACKUP_DIR="/tmp/npm-backup-$(date +%s)"
+NGINX_CONF_DIR="/etc/nginx/npm-conf.d"
+NODE_VERSION="22"; SCRIPT_VERSION="2.0.0"
+LOG_FILE="/var/log/npm-setup.log"
+ENV_FILE="$NPM_DIR/.env"
+UPSTREAM_REPO="https://github.com/NginxProxyManager/nginx-proxy-manager.git"
+
+# ─── 端口默认值 ───────────────────────────────────────────
+PORT_HTTP=80; PORT_HTTPS=443; PORT_ADMIN=81; PORT_BACKEND=3000
+
+# ─── 辅助函数 ─────────────────────────────────────────────
+log()     { echo -e "${GREEN}[✓]${NC} $1"; }
+info()    { echo -e "${BLUE}[i]${NC} $1"; }
+warn()    { echo -e "${YELLOW}[!]${NC} $1"; }
+error()   { echo -e "${RED}[✗]${NC} $1"; }
+header()  { echo -e "\n${BOLD}${CYAN}━━━ $1 ━━━${NC}\n"; }
+section() { echo -e "\n${BOLD}${WHITE}▶ $1${NC}"; }
+spacer()  { echo ""; }
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error "请以 root 身份运行: sudo bash $0"
+        exit 1
+    fi
+}
+
+print_banner() {
+    clear
+    echo -e "${CYAN}"
+    echo '  ╔═══════════════════════════════════════════════╗'
+    echo '  ║     Nginx Proxy Manager - Bare-Metal         ║'
+    echo '  ║     部署工具 v'$SCRIPT_VERSION'                          ║'
+    echo '  ╚═══════════════════════════════════════════════╝'
+    echo -e "${NC}"
+    echo -e "${DIM}  目录: $NPM_DIR${NC}"
+    spacer
+}
+
+confirm() {
+    local prompt=$1; local default=${2:-n}; local yn
+    [[ "$default" == "y" ]] && prompt="$prompt [Y/n]" || prompt="$prompt [y/N]"
+    read -r -p "$(echo -e "${YELLOW}?${NC} $prompt ")" yn
+    case "$yn" in [Yy]*) return 0;; [Nn]*) return 1;; "") [[ "$default" == "y" ]];;
+    esac
+}
+
+read_port() {
+    local prompt=$1; local default=$2; local input
+    while true; do
+        read -r -p "$(echo -e "${YELLOW}?${NC} $prompt [${default}]: ")" input
+        input="${input:-$default}"
+        if [[ "$input" =~ ^[0-9]+$ ]] && [[ "$input" -ge 1 ]] && [[ "$input" -le 65535 ]]; then
+            echo "$input"; return
+        fi
+        warn "端口号必须在 1-65535 之间"
+    done
+}
+
+save_env() {
+    mkdir -p "$(dirname "$ENV_FILE")"
+    cat > "$ENV_FILE" << ENVEOF
+# NPM Bare-Metal 端口配置 (由 setup.sh 自动管理)
+PORT_HTTP=$PORT_HTTP
+PORT_HTTPS=$PORT_HTTPS
+PORT_ADMIN=$PORT_ADMIN
+PORT_BACKEND=$PORT_BACKEND
+NPM_DIR=$NPM_DIR
+DATA_DIR=$DATA_DIR
+ENVEOF
+    chmod 600 "$ENV_FILE"
+    log "配置已保存到 $ENV_FILE"
+}
+
+load_env() {
+    [[ -f "$ENV_FILE" ]] && . "$ENV_FILE" && \
+        info "已加载配置: HTTP=$PORT_HTTP HTTPS=$PORT_HTTPS 管理=$PORT_ADMIN 后端=$PORT_BACKEND"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 端口配置
+# ═══════════════════════════════════════════════════════════════
+
+configure_ports() {
+    header "端口自定义配置"
+    echo -e "  ${DIM}可自定义端口以避免与现有服务冲突${NC}\n"
+    info "当前: HTTP=$PORT_HTTP HTTPS=$PORT_HTTPS 管理=$PORT_ADMIN 后端=$PORT_BACKEND"
+    spacer
+    if ! confirm "是否修改端口配置？" "n"; then return; fi
+    spacer
+
+    PORT_HTTP=$(read_port "HTTP 代理端口" "$PORT_HTTP")
+    PORT_HTTPS=$(read_port "HTTPS 代理端口" "$PORT_HTTPS")
+    PORT_ADMIN=$(read_port "管理后台端口" "$PORT_ADMIN")
+    PORT_BACKEND=$(read_port "Node.js 后端端口" "$PORT_BACKEND")
+
+    if [[ "$PORT_HTTP" == "$PORT_ADMIN" || "$PORT_HTTP" == "$PORT_HTTPS" \
+       || "$PORT_ADMIN" == "$PORT_HTTPS" || "$PORT_BACKEND" == "$PORT_ADMIN" \
+       || "$PORT_BACKEND" == "$PORT_HTTP" || "$PORT_BACKEND" == "$PORT_HTTPS" ]]; then
+        warn "端口不能重复"; spacer; configure_ports; return
+    fi
+
+    info "最终方案: HTTP=$PORT_HTTP HTTPS=$PORT_HTTPS 管理=$PORT_ADMIN 后端=$PORT_BACKEND"
+    confirm "确认？" "y" || configure_ports
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 检测
+# ═══════════════════════════════════════════════════════════════
+
+detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release; OS_NAME="$ID"; OS_VERSION="$VERSION_ID"
+    else
+        OS_NAME=$(uname -s); OS_VERSION=$(uname -r)
+    fi
+    info "系统: $OS_NAME $OS_VERSION"
+    if [[ "$OS_NAME" != "ubuntu" && "$OS_NAME" != "debian" ]]; then
+        warn "本脚本支持 Ubuntu/Debian，当前系统为 $OS_NAME"
+        confirm "是否继续？" "n" || exit 1
+    fi
+}
+
+detect_arch() {
+    ARCH=$(uname -m)
+    case "$ARCH" in x86_64|aarch64) info "架构: $ARCH ✓";; *) warn "架构: $ARCH (可能不兼容)";; esac
+}
+
+detect_existing_npm() {
+    if [[ -d "$NPM_DIR/backend" ]]; then warn "发现安装目录: $NPM_DIR"; return 0; fi
+    if systemctl is-enabled npm-backend &>/dev/null 2>&1; then warn "发现 npm-backend 服务"; return 0; fi
+    if pgrep -f "node.*index.js" | grep -q "nginx-proxy-manager" 2>/dev/null; then warn "发现运行中的后端进程"; return 0; fi
+    return 1
+}
+
+detect_port_conflicts() {
+    local ports=($PORT_HTTP $PORT_HTTPS $PORT_ADMIN $PORT_BACKEND)
+    local has_conflict=false; local seen=()
+    header "端口冲突检测"
+    for port in "${ports[@]}"; do
+        [[ " ${seen[*]} " =~ " $port " ]] && continue; seen+=("$port")
+        local pid; pid=$(ss -tlnp "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1)
+        if [[ -n "$pid" ]]; then
+            local proc; proc=$(ps -p "$pid" -o comm= 2>/dev/null || echo "未知")
+            warn "端口 $port 被占用 (PID: $pid, $proc)"; has_conflict=true
+        else info "端口 $port: 空闲"; fi
+    done
+    $has_conflict && return 0 || return 1
+}
+
+detect_nginx_conflicts() {
+    header "Nginx 配置检测"
+    if command -v nginx &>/dev/null; then
+        local sites; sites=$(find /etc/nginx/sites-enabled/ -maxdepth 1 \( -type l -o -type f \) 2>/dev/null | wc -l)
+        info "Nginx 已安装，$sites 个站点启用"
+        grep -r "npm-conf\|/data/nginx" /etc/nginx/ &>/dev/null 2>&1 && warn "配置含 NPM 残留"
+        nginx -t 2>/dev/null || warn "Nginx 配置有语法错误"
+    else info "Nginx 未安装 (将自动安装)"; fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 冲突解决
+# ═══════════════════════════════════════════════════════════════
+
+resolve_port_conflicts() {
+    local ports=($PORT_HTTP $PORT_HTTPS $PORT_ADMIN $PORT_BACKEND)
+    local resolved=false; local seen=()
+    section "端口冲突自动解决"
+    for port in "${ports[@]}"; do
+        [[ " ${seen[*]} " =~ " $port " ]] && continue; seen+=("$port")
+        local pid; pid=$(ss -tlnp "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1 || true)
+        [[ -z "$pid" ]] && continue
+        local unit; unit=$(systemctl status "$pid" 2>/dev/null | grep -oP '● \K[^. ]+' | head -1 || true)
+        if [[ -n "$unit" ]]; then
+            systemctl stop "$unit" 2>/dev/null || true; systemctl disable "$unit" 2>/dev/null || true
+            resolved=true; log "已停用 $unit，释放端口 $port"
+        else
+            warn "端口 $port 无法自动释放 (PID:$pid)"
+        fi
+    done
+    $resolved && return 0 || return 1
+}
+
+cleanup_old_install() {
+    section "清理旧安装残留"; local cleaned=false
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qi "nginx-proxy-manager\|npm"; then
+        docker stop nginx-proxy-manager 2>/dev/null || true; docker rm nginx-proxy-manager 2>/dev/null || true
+        cleaned=true; log "已清理 Docker 容器"
+    fi
+    for dir in "$NPM_DIR" "/app/nginx-proxy-manager"; do
+        [[ -d "$dir" ]] && confirm "删除目录 $dir？" "n" && rm -rf "$dir" && cleaned=true && log "已删除: $dir" || true
+    done
+    if [[ -f /etc/systemd/system/npm-backend.service ]]; then
+        systemctl stop npm-backend 2>/dev/null || true; systemctl disable npm-backend 2>/dev/null || true
+        rm -f /etc/systemd/system/npm-backend.service; systemctl daemon-reload; cleaned=true; log "已清理服务"
+    fi
+    [[ -d "$DATA_DIR" ]] && confirm "删除数据目录 $DATA_DIR？" "n" && rm -rf "$DATA_DIR" && cleaned=true && log "已删除数据"
+    [[ -d "$NGINX_CONF_DIR" ]] && rm -rf "$NGINX_CONF_DIR" && cleaned=true && log "已清理 Nginx 配置"
+    $cleaned && log "清理完成" || info "无残留"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 安装
+# ═══════════════════════════════════════════════════════════════
+
+install_deps() {
+    section "安装系统依赖"
+    apt-get update -qq && apt-get install -y --no-install-recommends \
+        nginx certbot python3 python3-certbot-nginx \
+        git curl jq logrotate ca-certificates sqlite3 lsof > /dev/null
+    log "系统依赖安装完成"
+}
+
+install_nodejs() {
+    section "安装 Node.js $NODE_VERSION"
+    if command -v node &>/dev/null; then
+        local ver; ver=$(node --version)
+        [[ "$ver" =~ v([0-9]+) ]] && [[ "${BASH_REMATCH[1]}" -ge 18 ]] && log "Node.js $ver ✓" && return
+        info "升级到 $NODE_VERSION ..."
+    fi
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | bash -
+    apt-get install -y nodejs > /dev/null; log "Node.js $(node --version) 安装完成"
+}
+
+create_user() {
+    section "创建运行用户"
+    id -u "$NPM_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin -d "$NPM_DIR" "$NPM_USER"
+    info "用户 $NPM_USER ✓"
+}
+
+install_node_deps() {
+    section "安装 Node.js 依赖 (精简版)"
+    cd "$NPM_DIR/backend"
+    su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm install --no-audit --no-fund" &
+    local pid=$!; echo -ne "${DIM}  安装中 ...${NC}"
+    while kill -0 "$pid" 2>/dev/null; do echo -n "."; sleep 1; done
+    echo -e " ${GREEN}done${NC}"
+    wait "$pid"
+
+    if confirm "移除 MySQL/PostgreSQL 驱动以节省内存？" "y"; then
+        npm uninstall mysql2 pg sqlite3 2>/dev/null || true; log "已移除多余 DB 驱动"
+    fi
+
+    # ─── 后端端口 patch ───────────────────────────────────
+    if [[ "$PORT_BACKEND" -ne 3000 ]]; then
+        sed -i "s/app\.listen(3000/app.listen($PORT_BACKEND/" "$NPM_DIR/backend/index.js"
+        log "后端端口 → $PORT_BACKEND"
+    fi
+}
+
+configure_nginx() {
+    section "配置 Nginx 隔离环境"
+    # 备份
+    mkdir -p "$BACKUP_DIR"; [[ -d /etc/nginx ]] && cp -r /etc/nginx "$BACKUP_DIR/nginx-backup" && log "Nginx 已备份"
+
+    mkdir -p "$NGINX_CONF_DIR"
+    cat > "$NGINX_CONF_DIR/npm-admin.conf" << NGINX_CONF
+server {
+    listen ${PORT_ADMIN};
+    server_name _;
+    charset utf-8;
+    access_log /var/log/npm/admin-access.log;
+    error_log /var/log/npm/admin-error.log warn;
+    root ${NPM_DIR}/frontend/dist;
+    index index.html;
+
+    location / { try_files \$uri \$uri/ /index.html; }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:${PORT_BACKEND};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+    }
+    location /socket.io/ {
+        proxy_pass http://127.0.0.1:${PORT_BACKEND};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_cache_bypass \$http_upgrade;
+    }
+    location /tokens/ {
+        proxy_pass http://127.0.0.1:${PORT_BACKEND};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+}
+NGINX_CONF
+    log "Nginx 管理面板配置已生成 (端口 $PORT_ADMIN → backend:$PORT_BACKEND)"
+
+    mkdir -p /data/nginx/{custom,proxy_host,redirection_host,stream,dead_host,temp}
+    chown -R "$NPM_USER:$NPM_GROUP" /data/nginx
+
+    local nginx_conf="/etc/nginx/nginx.conf"
+    if [[ -f "$nginx_conf" ]] && ! grep -q "npm-conf.d" "$nginx_conf" 2>/dev/null; then
+        sed -i '/^http {/a\    include /etc/nginx/npm-conf.d/*.conf;' "$nginx_conf"
+        sed -i '/^http {/a\    include /data/nginx/custom/http_top.conf;' "$nginx_conf"
+        log "已向 nginx.conf 注入 NPM include"
+    fi
+
+    if nginx -t 2>/dev/null; then
+        systemctl reload nginx; log "Nginx 重载成功"
+    else
+        warn "Nginx 测试失败，恢复备份..."
+        cp -r "$BACKUP_DIR/nginx-backup"/* /etc/nginx/ 2>/dev/null || true
+        systemctl reload nginx 2>/dev/null || true
+        error "请手动检查 nginx -t"
+    fi
+}
+
+create_data_dirs() {
+    section "创建数据目录"
+    mkdir -p "$DATA_DIR" "$LOG_DIR"
+    chown -R "$NPM_USER:$NPM_GROUP" "$DATA_DIR" "$LOG_DIR"
+    log "数据: $DATA_DIR | 日志: $LOG_DIR"
+}
+
+create_systemd_service() {
+    section "创建 systemd 服务"
+    cat > /etc/systemd/system/npm-backend.service << SERVICE
+[Unit]
+Description=Nginx Proxy Manager Backend
+Documentation=https://nginxproxymanager.com
+After=network.target nginx.service
+Wants=nginx.service
+
+[Service]
+Type=simple
+User=${NPM_USER}
+Group=${NPM_GROUP}
+WorkingDirectory=${NPM_DIR}/backend
+Environment=NODE_OPTIONS="--max-old-space-size=256"
+Environment=NODE_ENV=production
+Environment=DB_SQLITE_FILE=${DATA_DIR}/database.sqlite
+Environment=DISABLE_IPV6=true
+Environment=IP_RANGES_FETCH_ENABLED=false
+ExecStart=/usr/bin/node index.js
+ExecReload=/bin/kill -SIGTERM \$MAINPID
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=full
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+    systemctl daemon-reload; log "Systemd 服务已创建"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 健康检查
+# ═══════════════════════════════════════════════════════════════
+
+health_check() {
+    local all_pass=true
+    header "🩺 健康检查"
+
+    # 1. systemd 服务
+    echo -ne "  ${BOLD}[服务]${NC} npm-backend  "
+    if systemctl is-active npm-backend &>/dev/null; then
+        echo -e "${GREEN}● 运行中${NC}"
+    elif systemctl is-failed npm-backend &>/dev/null; then
+        echo -e "${RED}✗ 失败${NC}"; all_pass=false
+    else
+        echo -e "${YELLOW}○ 未运行${NC}"; all_pass=false
+    fi
+
+    # 2. Nginx
+    echo -ne "  ${BOLD}[服务]${NC} nginx       "
+    if systemctl is-active nginx &>/dev/null; then
+        echo -e "${GREEN}● 运行中${NC}"
+    else
+        echo -e "${YELLOW}○ 未运行${NC}"; all_pass=false
+    fi
+
+    # 3. 端口监听
+    local ports=($PORT_ADMIN $PORT_HTTP $PORT_HTTPS $PORT_BACKEND)
+    local seen=()
+    for port in "${ports[@]}"; do
+        [[ " ${seen[*]} " =~ " $port " ]] && continue; seen+=("$port")
+        echo -ne "  ${BOLD}[端口]${NC} $port       "
+        if ss -tlnp "sport = :$port" 2>/dev/null | grep -q LISTEN; then
+            echo -e "${GREEN}监听中${NC}"
+        else
+            echo -e "${RED}未监听${NC}"; all_pass=false
+        fi
+    done
+
+    # 4. HTTP 响应 (管理后台)
+    echo -ne "  ${BOLD}[HTTP]${NC} :$PORT_ADMIN "
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 \
+        "http://127.0.0.1:$PORT_ADMIN" 2>/dev/null || echo "000")
+    if [[ "$http_code" == "200" || "$http_code" == "302" || "$http_code" == "301" ]]; then
+        echo -e "${GREEN}${http_code}${NC}"
+    else
+        echo -e "${RED}${http_code}${NC}"; all_pass=false
+    fi
+
+    # 5. 数据库
+    local db_file="${DATA_DIR}/database.sqlite"
+    echo -ne "  ${BOLD}[数据库]${NC} SQLite    "
+    if [[ -f "$db_file" ]]; then
+        local db_size; db_size=$(du -h "$db_file" | cut -f1)
+        echo -e "${GREEN}存在 ($db_size)${NC}"
+    else
+        echo -e "${YELLOW}未创建 (首次启动自动生成)${NC}"
+    fi
+
+    # 6. Nginx 配置语法
+    echo -ne "  ${BOLD}[Nginx]${NC} 语法检查 "
+    if nginx -t 2>/dev/null 1>&2; then
+        echo -e "${GREEN}通过${NC}"
+    else
+        echo -e "${RED}失败${NC}"; all_pass=false
+    fi
+
+    # 7. Node.js 进程
+    echo -ne "  ${BOLD}[进程]${NC} node        "
+    if pgrep -f "node.*index.js" | grep -q . 2>/dev/null; then
+        echo -e "${GREEN}运行中${NC}"
+    else
+        echo -e "${RED}未运行${NC}"; all_pass=false
+    fi
+
+    spacer
+    if $all_pass; then
+        echo -e "  ${GREEN}${BOLD}✔ 所有检查通过，部署状态正常${NC}"
+    else
+        echo -e "  ${YELLOW}${BOLD}⚠ 部分检查未通过，请查看上方详情${NC}"
+        echo -e "  ${DIM}  日志: journalctl -u npm-backend -n 50 --no-pager${NC}"
+    fi
+    spacer
+    $all_pass && return 0 || return 1
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 升级模块
+# ═══════════════════════════════════════════════════════════════
+
+upgrade_npm() {
+    print_banner
+    header "升级 Nginx Proxy Manager"
+
+    # 检查是否为 git 仓库
+    if [[ ! -d "$NPM_DIR/.git" ]]; then
+        error "不是 git 仓库，无法升级。请通过 git clone 安装"
+        return 1
+    fi
+
+    # 检查是否有未提交的修改
+    cd "$NPM_DIR"
+    if ! git diff --quiet HEAD 2>/dev/null; then
+        warn "检测到本地修改"
+        confirm "是否暂存(stash)后继续？" "y" || return 1
+        git stash -u 2>/dev/null || true
+        log "已暂存本地修改"
+    fi
+
+    # 从 origin (用户自己的 fork) 拉取
+    info "正在从 origin 拉取更新..."
+    if ! git fetch origin 2>&1; then
+        error "从 origin 拉取失败，检查网络或仓库权限"
+        return 1
+    fi
+
+    # 检查是否有更新
+    local behind
+    behind=$(git rev-list --count HEAD..origin/$(git rev-parse --abbrev-ref HEAD) 2>/dev/null || echo 0)
+    if [[ "$behind" -eq 0 ]]; then
+        info "当前已是最新 (已同步 origin)"
+    else
+        info "发现 $behind 个新提交"
+        confirm "确认升级？" "y" || return 1
+        git merge origin/$(git rev-parse --abbrev-ref HEAD) --no-edit 2>&1 || {
+            warn "合并冲突，请手动解决后重试"
+            return 1
+        }
+        log "代码已更新到最新版本"
+    fi
+
+    # 同时检查上游 (jc21/nginx-proxy-manager) 用于跨 fork 升级
+    if ! git remote get-url upstream &>/dev/null; then
+        if confirm "是否添加上游仓库 (jc21) 以便获取官方更新？" "y"; then
+            git remote add upstream "$UPSTREAM_REPO"
+            log "已添加上游: $UPSTREAM_REPO"
+        fi
+    fi
+
+    if git remote get-url upstream &>/dev/null; then
+        info "正在从 upstream (官方) 检查更新..."
+        git fetch upstream 2>&1 || warn "无法从上游获取"
+        local upstream_behind
+        upstream_behind=$(git rev-list --count HEAD..upstream/develop 2>/dev/null || echo 0)
+        if [[ "$upstream_behind" -gt 0 ]]; then
+            info "官方上游有 $upstream_behind 个新提交"
+            if confirm "合并官方上游更新？" "n"; then
+                git merge upstream/develop --no-edit 2>&1 || {
+                    warn "合并冲突，请手动解决"
+                    return 1
+                }
+                log "已合并官方上游更新"
+            fi
+        else
+            info "已与官方上游同步"
+        fi
+    fi
+
+    spacer
+    section "重新应用自定义配置"
+
+    # 重新加载环境变量
+    load_env
+
+    # 重新安装 Node 依赖
+    cd "$NPM_DIR/backend"
+    su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm install --no-audit --no-fund" || true
+
+    # 重新应用后端端口 patch
+    if [[ -f "$ENV_FILE" ]]; then
+        . "$ENV_FILE"
+        if [[ "$PORT_BACKEND" -ne 3000 ]]; then
+            sed -i "s/app\.listen(3000/app.listen($PORT_BACKEND/" "$NPM_DIR/backend/index.js"
+            log "重新应用后端端口: $PORT_BACKEND"
+        fi
+    fi
+
+    # 重建前端
+    if [[ -d "$NPM_DIR/frontend" ]]; then
+        if confirm "重新构建前端？" "y"; then
+            cd "$NPM_DIR/frontend"
+            npm install --no-audit --no-fund 2>/dev/null || true
+            npm run build 2>/dev/null && log "前端构建完成" || warn "前端构建失败"
+        fi
+    fi
+
+    # 重新生成 Nginx 配置
+    configure_nginx
+
+    spacer
+    section "重启服务"
+    systemctl daemon-reload
+    systemctl restart npm-backend 2>/dev/null || true
+    sleep 2
+
+    info "运行健康检查..."
+    health_check
+
+    log "升级流程完成"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 卸载
+# ═══════════════════════════════════════════════════════════════
+
+uninstall_npm() {
+    print_banner; load_env
+    header "卸载 Nginx Proxy Manager"
+    [[ ! -d "$NPM_DIR" ]] && [[ ! -f /etc/systemd/system/npm-backend.service ]] && \
+        warn "未检测到 NPM 安装" && return
+
+    spacer
+    echo -e "  ${BOLD}1${NC}. 保留数据卸载 (配置/证书/数据库)"
+    echo -e "  ${BOLD}2${NC}. 完全卸载 (清除所有)"
+    echo -e "  ${BOLD}3${NC}. 取消"
+    spacer
+    read -r -p "$(echo -e "${YELLOW}?${NC} 请选择 [1-3]: ")" mode
+    case "$mode" in
+        1) uninstall_keep ;;
+        2) uninstall_purge ;;
+        3) info "已取消" ; return ;;
+        *) warn "无效" ; uninstall_npm ;;
+    esac
+}
+
+uninstall_keep() {
+    confirm "确认保留数据并卸载？" "n" || return
+    systemctl stop npm-backend 2>/dev/null || true
+    systemctl disable npm-backend 2>/dev/null || true
+    rm -f /etc/systemd/system/npm-backend.service; systemctl daemon-reload; log "服务已移除"
+    if [[ -d "$NGINX_CONF_DIR" ]]; then
+        mkdir -p "$BACKUP_DIR/nginx-conf"; cp -r "$NGINX_CONF_DIR" "$BACKUP_DIR/nginx-conf/"
+        rm -rf "$NGINX_CONF_DIR"; log "Nginx 配置已备份到 $BACKUP_DIR/nginx-conf 并移除"
+    fi
+    sed -i '/npm-conf\.d/d' /etc/nginx/nginx.conf 2>/dev/null || true
+    systemctl reload nginx 2>/dev/null || true
+    info "数据保留: $DATA_DIR"; info "安装目录保留: $NPM_DIR"
+    log "卸载完成 (保留数据)"
+}
+
+uninstall_purge() {
+    confirm "确认完全卸载（所有数据将被删除）？" "n" || return
+    systemctl stop npm-backend 2>/dev/null || true
+    systemctl disable npm-backend 2>/dev/null || true
+    rm -f /etc/systemd/system/npm-backend.service; systemctl daemon-reload
+
+    [[ -d "$NPM_DIR" ]] && rm -rf "$NPM_DIR" && log "已删除安装目录"
+    rm -rf "$NGINX_CONF_DIR"
+    sed -i '/npm-conf\.d/d' /etc/nginx/nginx.conf 2>/dev/null || true
+    systemctl reload nginx 2>/dev/null || true; log "已清理 Nginx 配置"
+    [[ -d "$DATA_DIR" ]] && rm -rf "$DATA_DIR" && log "已删除数据"
+    [[ -d "$LOG_DIR" ]] && rm -rf "$LOG_DIR" && log "已删除日志"
+
+    confirm "删除 npm 系统用户？" "n" && userdel -r "$NPM_USER" 2>/dev/null || true
+    log "完全卸载完成，无残留"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 状态
+# ═══════════════════════════════════════════════════════════════
+
+show_status() {
+    print_banner; load_env; header "NPM 安装状态"
+    echo -ne "  后端服务   "; systemctl is-active npm-backend &>/dev/null && echo -e "${GREEN}● 运行中${NC}" || echo -e "${RED}○ 未运行${NC}"
+    echo -ne "  Nginx      "; systemctl is-active nginx &>/dev/null && echo -e "${GREEN}● 运行中${NC}" || echo -e "${RED}○ 未运行${NC}"
+    echo -ne "  Node.js    "; command -v node &>/dev/null && echo -e "${GREEN}$(node --version)${NC}" || echo -e "${RED}未安装${NC}"
+    echo -ne "  安装目录   "; [[ -d "$NPM_DIR" ]] && echo -e "${GREEN}$NPM_DIR${NC}" || echo -e "${RED}不存在${NC}"
+    echo -ne "  数据目录   "
+    if [[ -d "$DATA_DIR" ]]; then local size; size=$(du -sh "$DATA_DIR" 2>/dev/null | cut -f1); echo -e "${GREEN}$DATA_DIR ($size)${NC}"; else echo -e "${DIM}不存在${NC}"; fi
+    spacer; header "端口配置"
+    echo -e "  HTTP: ${CYAN}$PORT_HTTP${NC}  HTTPS: ${CYAN}$PORT_HTTPS${NC}  管理: ${CYAN}$PORT_ADMIN${NC}  后端: ${CYAN}$PORT_BACKEND${NC}"
+    spacer
+    health_check
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 安装主流程
+# ═══════════════════════════════════════════════════════════════
+
+run_install() {
+    print_banner; load_env
+    header "Nginx Proxy Manager 安装向导"
+    info "本工具将在不干扰现有服务的前提下安装 NPM\n"
+
+    section "第一步: 环境检测"
+    detect_os; detect_arch; spacer
+
+    section "第二步: 冲突检测"
+    local has_ports=false
+    detect_port_conflicts && has_ports=true; detect_nginx_conflicts; spacer
+
+    section "第三步: 遗留清理"
+    detect_existing_npm && confirm "先清理再重装？" "y" && cleanup_old_install
+    spacer
+
+    section "第四步: 端口配置"
+    configure_ports; spacer
+
+    if $has_ports; then
+        section "第五步: 冲突解决"
+        confirm "自动解决端口冲突？" "y" && resolve_port_conflicts
+        spacer
+    fi
+
+    spacer
+    echo -e "${BOLD}${WHITE}安装概要:${NC}"
+    echo -e "  · 安装目录:    ${CYAN}$NPM_DIR${NC}"
+    echo -e "  · 数据目录:    ${CYAN}$DATA_DIR${NC}"
+    echo -e "  · 端口:        ${CYAN}HTTP=$PORT_HTTP HTTPS=$PORT_HTTPS 管理=$PORT_ADMIN 后端=$PORT_BACKEND${NC}"
+    echo -e "  · 数据库:      ${CYAN}SQLite${NC}"
+    spacer; confirm "确认开始安装？" "y" || exit 1
+
+    spacer; header "开始安装"
+    install_deps; install_nodejs; create_user; install_node_deps
+    configure_nginx; create_data_dirs; save_env
+    create_systemd_service
+
+    section "启动服务"
+    systemctl enable nginx; systemctl start nginx || true
+    systemctl enable npm-backend; systemctl start npm-backend || true
+    sleep 3
+    systemctl is-active npm-backend &>/dev/null && log "后端已启动" || warn "后端启动失败"
+
+    spacer; header "✅ 部署完成"
+    echo -e "  ${GREEN}✓${NC} 管理后台: ${CYAN}http://<服务器IP>:${PORT_ADMIN}${NC}"
+    echo -e "  ${GREEN}✓${NC} HTTP 代理: ${CYAN}端口 ${PORT_HTTP}${NC}"
+    echo -e "  ${GREEN}✓${NC} HTTPS 代理: ${CYAN}端口 ${PORT_HTTPS}${NC}"
+    echo -e "  ${DIM}  首次访问自动进入初始化设置${NC}"
+    spacer
+
+    # ─── 健康检查 ───────────────────────────────────
+    health_check
+
+    spacer
+    echo -e "  ${YELLOW}管理:${NC} ${BOLD}bash deploy/setup.sh${NC}  交互菜单"
+    echo -e "  ${YELLOW}升级:${NC} ${BOLD}bash deploy/setup.sh upgrade${NC}"
+    echo -e "  ${YELLOW}卸载:${NC} ${BOLD}bash deploy/setup.sh uninstall${NC}"
+    echo -e "  ${YELLOW}状态:${NC} ${BOLD}bash deploy/setup.sh status${NC}"
+    spacer
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 主菜单
+# ═══════════════════════════════════════════════════════════════
+
+main_menu() {
+    print_banner
+    echo -e "  ${BOLD}1${NC}. 全新安装 NPM"
+    echo -e "  ${BOLD}2${NC}. 卸载 NPM"
+    echo -e "  ${BOLD}3${NC}. 升级 NPM"
+    echo -e "  ${BOLD}4${NC}. 健康检查"
+    echo -e "  ${BOLD}5${NC}. 查看状态"
+    echo -e "  ${BOLD}6${NC}. 退出"
+    spacer
+    read -r -p "$(echo -e "${YELLOW}?${NC} 请选择 [1-6]: ")" choice
+    case "$choice" in
+        1) run_install ;;
+        2) uninstall_npm ;;
+        3) upgrade_npm ;;
+        4) health_check ;;
+        5) show_status ;;
+        6) echo -e "${GREEN}再见!${NC}"; exit 0 ;;
+        *) warn "无效选项"; sleep 1; main_menu ;;
+    esac
+}
+
+handle_args() {
+    case "${1:-}" in
+        install)   check_root; run_install ;;
+        uninstall) check_root; uninstall_npm ;;
+        upgrade)   check_root; upgrade_npm ;;
+        health|check)  health_check ;;
+        status)    show_status ;;
+        --help|-h)
+            echo -e "${BOLD}用法:${NC} bash deploy/setup.sh [命令]"
+            echo -e "  (无参数)    交互式菜单"
+            echo -e "  install     安装 NPM"
+            echo -e "  uninstall   卸载 NPM"
+            echo -e "  upgrade     升级 NPM"
+            echo -e "  health      健康检查"
+            echo -e "  status      查看状态"
+            ;;
+        *) check_root; main_menu ;;
+    esac
+}
+
+handle_args "$@"
