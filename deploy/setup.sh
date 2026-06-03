@@ -864,7 +864,7 @@ install_menu() {
 
 main_menu() {
     print_banner
-    echo -e "  ${BOLD}1${NC}. 安装 / 重装 NPM"
+    echo -e "  ${BOLD}1${NC}. 全新安装 NPM"
     echo -e "  ${BOLD}2${NC}. 卸载 NPM"
     echo -e "  ${BOLD}3${NC}. 升级 NPM"
     echo -e "  ${BOLD}4${NC}. 健康检查"
