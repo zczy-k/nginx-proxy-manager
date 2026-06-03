@@ -35,6 +35,59 @@ header()  { echo -e "\n${BOLD}${CYAN}━━━ $1 ━━━${NC}\n"; }
 section() { echo -e "\n${BOLD}${WHITE}▶ $1${NC}"; }
 spacer()  { echo ""; }
 
+# ─── IP 检测 ─────────────────────────────────────────────
+detect_ip() {
+    # 尝试多个源获取公网 IP
+    SERVER_IP=""
+    for src in "https://api.ipify.org" "https://ifconfig.me" "https://icanhazip.com"; do
+        SERVER_IP=$(curl -s --connect-timeout 3 "$src" 2>/dev/null || true)
+        [[ -n "$SERVER_IP" ]] && break
+    done
+    # 回退到局域网 IP
+    if [[ -z "$SERVER_IP" ]]; then
+        SERVER_IP=$(ip -4 addr show | grep -oP 'inet \K[\d.]+' | grep -v '127.0.0.1' | head -1)
+    fi
+    # 最终回退
+    SERVER_IP="${SERVER_IP:-服务器IP}"
+}
+
+# ─── 防火墙提示 ──────────────────────────────────────────
+show_firewall_hint() {
+    local ports=($PORT_ADMIN $PORT_HTTP $PORT_HTTPS)
+    local port_str=""
+    local seen=()
+    for p in "${ports[@]}"; do
+        [[ " ${seen[*]} " =~ " $p " ]] && continue; seen+=("$p")
+        [[ -z "$port_str" ]] && port_str="$p" || port_str="$port_str, $p"
+    done
+
+    echo -e "  ${YELLOW}防火墙端口放行提醒:${NC}"
+    echo -e "  ${DIM}  请确保以下端口已放行: $port_str${NC}\n"
+
+    if command -v ufw &>/dev/null; then
+        for p in "${ports[@]}"; do
+            echo -e "    ${BOLD}UFW:${NC} sudo ufw allow $p/tcp"
+        done
+    fi
+    if command -v firewall-cmd &>/dev/null; then
+        for p in "${ports[@]}"; do
+            echo -e "    ${BOLD}firewalld:${NC} sudo firewall-cmd --add-port=${p}/tcp --permanent"
+        done
+        echo -e "    ${DIM}    sudo firewall-cmd --reload${NC}"
+    fi
+    # iptables 作为通用回退
+    if ! command -v ufw &>/dev/null && ! command -v firewall-cmd &>/dev/null; then
+        for p in "${ports[@]}"; do
+            echo -e "    ${BOLD}iptables:${NC} sudo iptables -A INPUT -p tcp --dport $p -j ACCEPT"
+        done
+    fi
+    # 云服务商提示
+    echo -e ""
+    echo -e "  ${YELLOW}☁  云服务器额外注意:${NC}"
+    echo -e "  ${DIM}  如果使用阿里云/腾讯云/AWS等，还需在云控制台"
+    echo -e "  的安全组/防火墙规则中放行对应端口${NC}"
+}
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         error "请以 root 身份运行: sudo bash $0"
@@ -731,11 +784,23 @@ run_install() {
     sleep 3
     systemctl is-active npm-backend &>/dev/null && log "后端已启动" || warn "后端启动失败，查看日志: journalctl -u npm-backend -n 30"
 
+    detect_ip
     spacer; header "✅ 部署完成"
-    echo -e "  ${GREEN}✓${NC} 管理后台: ${CYAN}http://<服务器IP>:${PORT_ADMIN}${NC}"
-    echo -e "  ${GREEN}✓${NC} HTTP 代理: ${CYAN}端口 ${PORT_HTTP}${NC}"
-    echo -e "  ${GREEN}✓${NC} HTTPS 代理: ${CYAN}端口 ${PORT_HTTPS}${NC}"
-    echo -e "  ${DIM}  首次访问自动进入初始化设置${NC}"
+    echo -e "  ${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${GREEN}${BOLD}  管理后台已就绪${NC}"
+    echo -e "  ${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e ""
+    echo -e "  ${CYAN}${BOLD}  📎 访问地址:${NC}"
+    echo -e "  ${WHITE}${BOLD}    http://${SERVER_IP}:${PORT_ADMIN}${NC}"
+    echo -e "  ${DIM}    首次访问自动进入初始化设置${NC}"
+    echo -e ""
+    echo -e "  ${CYAN}${BOLD}  🔌 端口说明:${NC}"
+    echo -e "  ${WHITE}    HTTP 代理: ${BOLD}${PORT_HTTP}${NC}"
+    echo -e "  ${WHITE}    HTTPS 代理: ${BOLD}${PORT_HTTPS}${NC}"
+    echo -e "  ${WHITE}    管理后台: ${BOLD}${PORT_ADMIN}${NC}"
+    echo -e ""
+
+    show_firewall_hint
     spacer
 
     health_check
