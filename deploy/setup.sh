@@ -11,9 +11,9 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'
 BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
-# ─── 路径 (基于脚本位置自动推导) ──────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NPM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"  # 仓库根目录
+# ─── 路径 ──────────────────────────────────────────────────
+NPM_DIR="/opt/nginx-proxy-manager"
+SCRIPT_DIR="$NPM_DIR/deploy"
 NPM_USER="npm"; NPM_GROUP="npm"
 DATA_DIR="/data/npm"; LOG_DIR="/var/log/npm"
 BACKUP_DIR="/tmp/npm-backup-$(date +%s)"
@@ -22,9 +22,23 @@ NODE_VERSION="22"; SCRIPT_VERSION="2.0.0"
 LOG_FILE="/var/log/npm-setup.log"
 ENV_FILE="$NPM_DIR/.env"
 UPSTREAM_REPO="https://github.com/NginxProxyManager/nginx-proxy-manager.git"
+GIT_REPO="https://github.com/zczy-k/nginx-proxy-manager.git"
 
 # ─── 端口默认值 ───────────────────────────────────────────
 PORT_HTTP=80; PORT_HTTPS=443; PORT_ADMIN=81; PORT_BACKEND=3000
+
+# ─── 自引导: 如果通过 curl | bash 运行则先克隆仓库 ──────
+if [[ ! -f "$SCRIPT_DIR/setup.sh" ]]; then
+    echo "==> 正在克隆仓库到 $NPM_DIR ..."
+    if ! command -v git &>/dev/null; then
+        apt-get update -qq && apt-get install -y -qq git 2>/dev/null || \
+            { echo "请先安装 git: apt install git"; exit 1; }
+    fi
+    rm -rf "$NPM_DIR" 2>/dev/null || true
+    git clone --depth 1 "$GIT_REPO" "$NPM_DIR"
+    echo "==> 仓库克隆完成，启动部署工具..."
+    exec sudo bash "$SCRIPT_DIR/setup.sh" "$@"
+fi
 
 # ─── 辅助函数 ─────────────────────────────────────────────
 log()     { echo -e "${GREEN}[✓]${NC} $1"; }
