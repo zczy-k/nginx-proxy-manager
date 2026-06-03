@@ -471,6 +471,7 @@ health_check() {
 # ═══════════════════════════════════════════════════════════════
 
 upgrade_npm() {
+    check_root
     print_banner
     header "升级 Nginx Proxy Manager"
 
@@ -586,6 +587,7 @@ upgrade_npm() {
 # ═══════════════════════════════════════════════════════════════
 
 uninstall_npm() {
+    check_root
     print_banner; load_env
     header "卸载 Nginx Proxy Manager"
     [[ ! -d "$NPM_DIR" ]] && [[ ! -f /etc/systemd/system/npm-backend.service ]] && \
@@ -660,6 +662,7 @@ show_status() {
 # ═══════════════════════════════════════════════════════════════
 
 run_install() {
+    check_root
     print_banner; load_env
     header "Nginx Proxy Manager 安装向导"
     info "本工具将在不干扰现有服务的前提下安装 NPM\n"
@@ -762,7 +765,7 @@ handle_args() {
             echo -e "  health      健康检查"
             echo -e "  status      查看状态"
             ;;
-        *) check_root; main_menu ;;
+        *) main_menu ;;
     esac
 }
 
