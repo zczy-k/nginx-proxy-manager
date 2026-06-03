@@ -199,21 +199,49 @@ resolve_port_conflicts() {
 }
 
 cleanup_old_install() {
-    section "清理旧安装残留"; local cleaned=false
+    local force=${1:-false}; local cleaned=false
+    section "清理旧安装残留"
+
+    # 停用服务
+    if systemctl is-active npm-backend &>/dev/null 2>&1 || [[ -f /etc/systemd/system/npm-backend.service ]]; then
+        systemctl stop npm-backend 2>/dev/null || true; systemctl disable npm-backend 2>/dev/null || true
+        rm -f /etc/systemd/system/npm-backend.service; systemctl daemon-reload; cleaned=true
+        log "已停用并删除 npm-backend 服务"
+    fi
+
+    # Docker 容器
     if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qi "nginx-proxy-manager\|npm"; then
         docker stop nginx-proxy-manager 2>/dev/null || true; docker rm nginx-proxy-manager 2>/dev/null || true
         cleaned=true; log "已清理 Docker 容器"
     fi
+
+    # 删除安装目录
     for dir in "$NPM_DIR" "/app/nginx-proxy-manager"; do
-        [[ -d "$dir" ]] && confirm "删除目录 $dir？" "n" && rm -rf "$dir" && cleaned=true && log "已删除: $dir" || true
+        if [[ -d "$dir" ]]; then
+            if $force; then rm -rf "$dir"; cleaned=true; log "已删除: $dir"
+            else confirm "删除目录 $dir？" "n" && rm -rf "$dir" && cleaned=true && log "已删除: $dir" || true; fi
+        fi
     done
-    if [[ -f /etc/systemd/system/npm-backend.service ]]; then
-        systemctl stop npm-backend 2>/dev/null || true; systemctl disable npm-backend 2>/dev/null || true
-        rm -f /etc/systemd/system/npm-backend.service; systemctl daemon-reload; cleaned=true; log "已清理服务"
+
+    # 删除数据目录
+    if [[ -d "$DATA_DIR" ]]; then
+        if $force; then rm -rf "$DATA_DIR"; cleaned=true; log "已删除数据: $DATA_DIR"
+        else confirm "删除数据目录 $DATA_DIR？" "n" && rm -rf "$DATA_DIR" && cleaned=true && log "已删除数据" || true; fi
     fi
-    [[ -d "$DATA_DIR" ]] && confirm "删除数据目录 $DATA_DIR？" "n" && rm -rf "$DATA_DIR" && cleaned=true && log "已删除数据"
-    [[ -d "$NGINX_CONF_DIR" ]] && rm -rf "$NGINX_CONF_DIR" && cleaned=true && log "已清理 Nginx 配置"
-    $cleaned && log "清理完成" || info "无残留"
+
+    # 删除 Nginx 配置
+    if [[ -d "$NGINX_CONF_DIR" ]]; then
+        rm -rf "$NGINX_CONF_DIR"; cleaned=true; log "已清理 Nginx 配置"
+    fi
+    sed -i '/npm-conf\.d/d' /etc/nginx/nginx.conf 2>/dev/null || true
+    systemctl reload nginx 2>/dev/null || true
+
+    # 删除日志
+    if [[ -d "$LOG_DIR" ]]; then
+        $force && rm -rf "$LOG_DIR" && log "已删除日志" || true
+    fi
+
+    $cleaned && log "旧安装已完全清理" || info "无残留"
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -665,7 +693,7 @@ run_install() {
     check_root
     print_banner; load_env
     header "Nginx Proxy Manager 安装向导"
-    info "本工具将在不干扰现有服务的前提下安装 NPM\n"
+    info "本工具将自动补全缺失依赖，在不干扰现有服务的前提下安装 NPM\n"
 
     section "第一步: 环境检测"
     detect_os; detect_arch; spacer
@@ -674,16 +702,12 @@ run_install() {
     local has_ports=false
     detect_port_conflicts && has_ports=true; detect_nginx_conflicts; spacer
 
-    section "第三步: 遗留清理"
-    detect_existing_npm && confirm "先清理再重装？" "y" && cleanup_old_install
-    spacer
-
-    section "第四步: 端口配置"
+    section "第三步: 端口配置"
     configure_ports; spacer
 
     if $has_ports; then
-        section "第五步: 冲突解决"
-        confirm "自动解决端口冲突？" "y" && resolve_port_conflicts
+        section "第四步: 冲突解决"
+        confirm "自动解决端口冲突？" "y" && resolve_port_conflicts || true
         spacer
     fi
 
@@ -696,6 +720,7 @@ run_install() {
     spacer; confirm "确认开始安装？" "y" || exit 1
 
     spacer; header "开始安装"
+    # 自动补齐缺失的系统依赖和 Node.js
     install_deps; install_nodejs; create_user; install_node_deps
     configure_nginx; create_data_dirs; save_env
     create_systemd_service
@@ -704,7 +729,7 @@ run_install() {
     systemctl enable nginx; systemctl start nginx || true
     systemctl enable npm-backend; systemctl start npm-backend || true
     sleep 3
-    systemctl is-active npm-backend &>/dev/null && log "后端已启动" || warn "后端启动失败"
+    systemctl is-active npm-backend &>/dev/null && log "后端已启动" || warn "后端启动失败，查看日志: journalctl -u npm-backend -n 30"
 
     spacer; header "✅ 部署完成"
     echo -e "  ${GREEN}✓${NC} 管理后台: ${CYAN}http://<服务器IP>:${PORT_ADMIN}${NC}"
@@ -713,15 +738,47 @@ run_install() {
     echo -e "  ${DIM}  首次访问自动进入初始化设置${NC}"
     spacer
 
-    # ─── 健康检查 ───────────────────────────────────
     health_check
 
     spacer
-    echo -e "  ${YELLOW}管理:${NC} ${BOLD}bash deploy/setup.sh${NC}  交互菜单"
+    echo -e "  ${YELLOW}管理:${NC} ${BOLD}bash deploy/setup.sh${NC}"
     echo -e "  ${YELLOW}升级:${NC} ${BOLD}bash deploy/setup.sh upgrade${NC}"
     echo -e "  ${YELLOW}卸载:${NC} ${BOLD}bash deploy/setup.sh uninstall${NC}"
-    echo -e "  ${YELLOW}状态:${NC} ${BOLD}bash deploy/setup.sh status${NC}"
     spacer
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 安装子菜单
+# ═══════════════════════════════════════════════════════════════
+
+install_menu() {
+    print_banner
+    header "安装 Nginx Proxy Manager"
+    echo -e "  ${BOLD}1${NC}. 全新安装（检测并清理旧残留后安装）"
+    echo -e "  ${BOLD}2${NC}. 强制重装（先完全卸载旧版，清理所有残留，再全新安装）"
+    echo -e "  ${BOLD}3${NC}. 返回主菜单"
+    spacer
+    read -r -p "$(echo -e "${YELLOW}?${NC} 请选择 [1-3]: ")" choice
+    case "$choice" in
+        1)
+            # 全新安装：检测旧版，引导清理
+            detect_existing_npm && confirm "检测到旧安装，是否先清理？" "y" && cleanup_old_install false
+            run_install
+            ;;
+        2)
+            # 强制重装：不询问直接清除所有
+            if confirm "将完全卸载现有版本并删除所有数据，确认？" "n"; then
+                warn "正在强制清理所有旧安装..."; spacer
+                cleanup_old_install true
+                log "旧版已完全清除，开始重新安装"; spacer
+                run_install
+            else
+                info "已取消"; install_menu
+            fi
+            ;;
+        3) main_menu ;;
+        *) warn "无效选项"; sleep 1; install_menu ;;
+    esac
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -730,7 +787,7 @@ run_install() {
 
 main_menu() {
     print_banner
-    echo -e "  ${BOLD}1${NC}. 全新安装 NPM"
+    echo -e "  ${BOLD}1${NC}. 安装 / 重装 NPM"
     echo -e "  ${BOLD}2${NC}. 卸载 NPM"
     echo -e "  ${BOLD}3${NC}. 升级 NPM"
     echo -e "  ${BOLD}4${NC}. 健康检查"
@@ -739,7 +796,7 @@ main_menu() {
     spacer
     read -r -p "$(echo -e "${YELLOW}?${NC} 请选择 [1-6]: ")" choice
     case "$choice" in
-        1) run_install ;;
+        1) install_menu ;;
         2) uninstall_npm ;;
         3) upgrade_npm ;;
         4) health_check ;;
@@ -752,6 +809,7 @@ main_menu() {
 handle_args() {
     case "${1:-}" in
         install)   check_root; run_install ;;
+        reinstall) check_root; cleanup_old_install true; run_install ;;
         uninstall) check_root; uninstall_npm ;;
         upgrade)   check_root; upgrade_npm ;;
         health|check)  health_check ;;
@@ -759,9 +817,10 @@ handle_args() {
         --help|-h)
             echo -e "${BOLD}用法:${NC} bash deploy/setup.sh [命令]"
             echo -e "  (无参数)    交互式菜单"
-            echo -e "  install     安装 NPM"
-            echo -e "  uninstall   卸载 NPM"
-            echo -e "  upgrade     升级 NPM"
+            echo -e "  install     安装（引导式）"
+            echo -e "  reinstall   强制重装（先清除所有）"
+            echo -e "  uninstall   卸载"
+            echo -e "  upgrade     升级"
             echo -e "  health      健康检查"
             echo -e "  status      查看状态"
             ;;
