@@ -6,9 +6,17 @@
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
-# ─── 管道模式修复: curl | bash 时 stdin 被管道占用，交互 read 无法工作 ──
+# ─── 管道模式修复: curl | bash 时保存脚本到临时文件并重新执行 ──
+# 这样可以彻底脱离管道，获得正常的终端交互能力
 if [[ ! -t 0 ]]; then
-    exec </dev/tty
+    TMP_SCRIPT="$(mktemp /tmp/npm-setup.XXXXXX.sh)"
+    cat > "$TMP_SCRIPT"
+    chmod +x "$TMP_SCRIPT"
+    if [[ $EUID -eq 0 ]]; then
+        exec bash "$TMP_SCRIPT" "$@"
+    else
+        exec sudo bash "$TMP_SCRIPT" "$@"
+    fi
 fi
 
 # ─── 颜色 ─────────────────────────────────────────────────
