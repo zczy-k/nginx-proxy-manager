@@ -6,17 +6,21 @@
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
-# ─── 管道模式修复: curl | bash 时保存脚本到临时文件并重新执行 ──
-# 这样可以彻底脱离管道，获得正常的终端交互能力
+# ─── 管道模式修复 ──────────────────────────────────────────
+# curl | sudo bash 时，stdin 被管道占用，交互式 read 无法工作
+# 解决: 保存脚本到临时文件，以 /dev/tty 作为 stdin 重新执行
 if [[ ! -t 0 ]]; then
+    echo "  检测到管道模式，正在初始化..."
     TMP_SCRIPT="$(mktemp /tmp/npm-setup.XXXXXX.sh)"
     cat > "$TMP_SCRIPT"
     chmod +x "$TMP_SCRIPT"
-    if [[ $EUID -eq 0 ]]; then
-        exec bash "$TMP_SCRIPT" "$@"
-    else
-        exec sudo bash "$TMP_SCRIPT" "$@"
-    fi
+    exec bash "$TMP_SCRIPT" "$@" </dev/tty
+fi
+
+# ─── Root 权限检查 ─────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+    echo "需要 root 权限，正在使用 sudo 重新运行..."
+    exec sudo bash "$0" "$@"
 fi
 
 # ─── 颜色 ─────────────────────────────────────────────────
@@ -63,11 +67,7 @@ if [[ ! -f "$SCRIPT_DIR/setup.sh" ]]; then
     git clone --depth 1 "$GIT_REPO" "$NPM_DIR" 2>/dev/null && \
         echo -e "  ${GREEN}✓ 仓库克隆完成${NC}\n" || \
         { echo -e "  ${RED}✗ 克隆失败，请检查网络${NC}"; exit 1; }
-    if [[ $EUID -eq 0 ]]; then
-        exec bash "$SCRIPT_DIR/setup.sh" "$@"
-    else
-        exec sudo bash "$SCRIPT_DIR/setup.sh" "$@"
-    fi
+    exec bash "$SCRIPT_DIR/setup.sh" "$@" </dev/tty
 fi
 
 # ─── 辅助函数 ─────────────────────────────────────────────
