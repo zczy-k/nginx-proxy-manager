@@ -218,7 +218,7 @@ configure_ports() {
     fi
 
     info "最终方案: HTTP=$PORT_HTTP HTTPS=$PORT_HTTPS 管理=$PORT_ADMIN 后端=$PORT_BACKEND"
-    confirm "确认？" "y" || configure_ports
+    if ! confirm "确认？" "y"; then configure_ports; return; fi
 
     # 端口修改后重新检测冲突
     if detect_port_conflicts; then
@@ -1036,7 +1036,7 @@ install_flow() {
 
     # ─── 阶段 2: 检测并清理旧残留 ──────────────────────
     local has_traces=false
-    detect_existing_npm && has_traces=true
+    if detect_existing_npm; then has_traces=true; fi
 
     if $force || $has_traces; then
         if $force; then
@@ -1084,7 +1084,8 @@ run_install() {
 
     section "冲突检测"
     local has_ports=false
-    detect_port_conflicts && has_ports=true; detect_nginx_conflicts; spacer
+    if detect_port_conflicts; then has_ports=true; fi
+    detect_nginx_conflicts || true; spacer
 
     section "端口配置"
     configure_ports; spacer
