@@ -1,0 +1,25 @@
+--- a/backend/internal/nginx.js
++++ b/backend/internal/nginx.js
+@@ -104,7 +104,10 @@ const internalNginx = {
+ 	 */
+ 	test: () => {
+ 		debug(logger, "Testing Nginx configuration");
+-		return utils.execFile("/usr/sbin/nginx", ["-t", "-g", "error_log off;"]);
++		if (process.getuid() === 0) {
++			return utils.execFile("/usr/sbin/nginx", ["-t", "-g", "error_log off;"]);
++		}
++		return utils.execFile("sudo", ["/usr/sbin/nginx", "-t", "-g", "error_log off;"]);
+ 	},
+
+ 	/**
+@@ -113,7 +116,10 @@ const internalNginx = {
+ 	reload: () => {
+ 		return internalNginx.test().then(() => {
+ 			logger.info("Reloading Nginx");
+-			return utils.execFile("/usr/sbin/nginx", ["-s", "reload"]);
++			if (process.getuid() === 0) {
++				return utils.execFile("/usr/sbin/nginx", ["-s", "reload"]);
++			}
++			return utils.execFile("sudo", ["/usr/sbin/nginx", "-s", "reload"]);
+ 		});
+ 	},

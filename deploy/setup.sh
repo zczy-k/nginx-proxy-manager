@@ -30,14 +30,26 @@ PORT_HTTP=80; PORT_HTTPS=443; PORT_ADMIN=81; PORT_BACKEND=3000
 
 # ─── 自引导: 如果通过 curl | bash 运行则先克隆仓库 ──────
 if [[ ! -f "$SCRIPT_DIR/setup.sh" ]]; then
-    echo "==> 正在克隆仓库到 $NPM_DIR ..."
+    # 立即显示欢迎界面
+    clear
+    echo -e "${CYAN}"
+    echo '  ╔═══════════════════════════════════════════════╗'
+    echo '  ║     Nginx Proxy Manager - Bare-Metal         ║'
+    echo '  ║     部署工具 v'$SCRIPT_VERSION'                          ║'
+    echo '  ╚═══════════════════════════════════════════════╝'
+    echo -e "${NC}"
+    echo -e "  ${YELLOW}首次运行，正在准备部署环境...${NC}\n"
+
     if ! command -v git &>/dev/null; then
+        echo -e "  ${DIM}安装 git ...${NC}"
         apt-get update -qq && apt-get install -y -qq git 2>/dev/null || \
-            { echo "请先安装 git: apt install git"; exit 1; }
+            { echo -e "  ${RED}请先安装 git: apt install git${NC}"; exit 1; }
     fi
     rm -rf "$NPM_DIR" 2>/dev/null || true
-    git clone --depth 1 "$GIT_REPO" "$NPM_DIR"
-    echo "==> 仓库克隆完成，启动部署工具..."
+    echo -e "  ${DIM}正在克隆仓库到 $NPM_DIR ...${NC}"
+    git clone --depth 1 "$GIT_REPO" "$NPM_DIR" 2>/dev/null && \
+        echo -e "  ${GREEN}✓ 仓库克隆完成${NC}\n" || \
+        { echo -e "  ${RED}✗ 克隆失败，请检查网络${NC}"; exit 1; }
     if [[ $EUID -eq 0 ]]; then
         exec bash "$SCRIPT_DIR/setup.sh" "$@"
     else
@@ -167,8 +179,14 @@ ENVEOF
 }
 
 load_env() {
-    [[ -f "$ENV_FILE" ]] && . "$ENV_FILE" && \
+    [[ -f "$ENV_FILE" ]] || return
+    # 安全校验: 只允许 KEY=VALUE 格式，防止注入
+    if grep -qE '^\\s*[^#]\\s*=' "$ENV_FILE" && ! grep -qE '[;&|`$()]' "$ENV_FILE"; then
+        . "$ENV_FILE"
         info "已加载配置: HTTP=$PORT_HTTP HTTPS=$PORT_HTTPS 管理=$PORT_ADMIN 后端=$PORT_BACKEND"
+    else
+        warn "$ENV_FILE 内容异常，跳过加载"
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -196,6 +214,15 @@ configure_ports() {
 
     info "最终方案: HTTP=$PORT_HTTP HTTPS=$PORT_HTTPS 管理=$PORT_ADMIN 后端=$PORT_BACKEND"
     confirm "确认？" "y" || configure_ports
+
+    # 端口修改后重新检测冲突
+    if detect_port_conflicts; then
+        warn "新端口方案存在冲突，请解决后继续"
+        spacer
+        if confirm "自动解决端口冲突？" "n"; then
+            resolve_port_conflicts || true
+        fi
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -294,6 +321,8 @@ cleanup_old_install() {
         systemctl stop npm-backend 2>/dev/null || true
         systemctl disable npm-backend 2>/dev/null || true
         rm -f /etc/systemd/system/npm-backend.service
+        rm -f /etc/sudoers.d/npm-backend
+        rm -f /etc/logrotate.d/nginx-proxy-manager
         systemctl daemon-reload 2>/dev/null || true
         cleaned=true
         log "已停用并删除 npm-backend 服务"
@@ -351,9 +380,19 @@ install_deps() {
     apt-get update -qq || true
     # 系统包推荐安装 (包括 certbot 所需的推荐依赖)
     apt-get install -y \
-        nginx certbot python3 python3-certbot-nginx \
+        nginx certbot python3 python3-venv python3-certbot-nginx \
         git curl jq logrotate ca-certificates sqlite3 lsof > /dev/null
     log "系统依赖安装完成"
+
+    # 创建 certbot Python venv (后端 certbot.js 硬编码 /opt/certbot/ 路径)
+    if [[ ! -f /opt/certbot/bin/activate ]]; then
+        python3 -m venv /opt/certbot
+        /opt/certbot/bin/pip install --upgrade pip --quiet 2>/dev/null || true
+        /opt/certbot/bin/pip install --quiet certbot certbot-nginx 2>/dev/null || true
+        log "Certbot venv 已创建 (/opt/certbot/)"
+    else
+        info "Certbot venv 已存在"
+    fi
 }
 
 install_nodejs() {
@@ -381,8 +420,43 @@ create_user() {
     info "用户 $NPM_USER ✓ (权限已调整)"
 }
 
+apply_patches() {
+    section "应用裸机部署补丁"
+    local patch_dir="$SCRIPT_DIR/patches"
+    if [[ ! -d "$patch_dir" ]]; then
+        warn "补丁目录 $patch_dir 不存在，跳过"; return
+    fi
+    local count=0
+    for p in "$patch_dir"/*.patch; do
+        [[ -f "$p" ]] || continue
+        local pname; pname=$(basename "$p")
+        if patch -p1 --dry-run -d "$NPM_DIR" < "$p" &>/dev/null; then
+            patch -p1 -d "$NPM_DIR" < "$p" &>/dev/null
+            log "已应用补丁: $pname"; ((count++))
+        else
+            warn "补丁 $pname 无法应用 (可能上游代码已变更)，跳过"
+        fi
+    done
+    if [[ $count -eq 0 ]]; then
+        warn "未应用任何补丁 (可能已应用或上游代码已变更)"
+    else
+        log "共应用 $count 个补丁"
+    fi
+    # 补丁后重新 chown (补丁可能修改了文件)
+    chown -R "$NPM_USER:$NPM_GROUP" "$NPM_DIR" 2>/dev/null || true
+}
+
 install_node_deps() {
     section "安装 Node.js 依赖 (精简版)"
+
+    # 使用精简版 package.json (better-sqlite3 替代 mysql2/pg/sqlite3)
+    if [[ -f "$SCRIPT_DIR/backend/package.json" ]]; then
+        cp "$SCRIPT_DIR/backend/package.json" "$NPM_DIR/backend/package.json"
+        log "已替换为精简版 package.json (仅 SQLite + better-sqlite3)"
+    else
+        warn "未找到精简版 package.json ($SCRIPT_DIR/backend/package.json)，使用原始版本"
+    fi
+
     cd "$NPM_DIR/backend"
     su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm install --no-audit --no-fund" &
     local pid=$!; echo -ne "${DIM}  安装中 ...${NC}"
@@ -390,10 +464,9 @@ install_node_deps() {
     echo -e " ${GREEN}done${NC}"
     wait "$pid" || { error "npm install 失败"; return 1; }
 
-    if confirm "移除 MySQL/PostgreSQL 驱动以节省内存？" "y"; then
-        su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm uninstall mysql2 pg sqlite3 --no-audit --no-fund" 2>/dev/null || true
-        log "已移除多余 DB 驱动"
-    fi
+    # 移除多余数据库驱动 (精简版 package.json 已不包含，此为安全兜底)
+    su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm uninstall mysql2 pg sqlite3 --no-audit --no-fund" 2>/dev/null || true
+    log "已确保移除多余 DB 驱动 (mysql2/pg/sqlite3)"
 
     # ─── 后端端口 patch ───────────────────────────────────
     if [[ "$PORT_BACKEND" -ne 3000 ]]; then
@@ -503,6 +576,32 @@ NGINX_CONF
     mkdir -p "$NGINX_DATA_DIR"/{custom,proxy_host,redirection_host,stream,dead_host,temp}
     chown -R "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR"
 
+    # 创建 http_top.conf 占位文件 (已注入 nginx.conf include，文件必须存在)
+    if [[ ! -f "$NGINX_DATA_DIR/custom/http_top.conf" ]]; then
+        touch "$NGINX_DATA_DIR/custom/http_top.conf"
+        chown "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR/custom/http_top.conf"
+        log "已创建 http_top.conf 占位文件"
+    fi
+
+    # 创建默认站点配置 (后端 internal/nginx.js 引用 /data/nginx/default_host/site.conf)
+    if [[ ! -f "$NGINX_DATA_DIR/default_host/site.conf" ]]; then
+        cat > "$NGINX_DATA_DIR/default_host/site.conf" << 'DEFAULTEOF'
+# NPM 默认站点 - 显示欢迎页面
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    root /var/www/html;
+    index index.html;
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+DEFAULTEOF
+        chown "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR/default_host/site.conf"
+        log "已创建默认站点配置"
+    fi
+
     local nginx_conf="/etc/nginx/nginx.conf"
     if [[ -f "$nginx_conf" ]] && ! grep -q "npm-conf.d" "$nginx_conf" 2>/dev/null; then
         sed -i '/^http {/a\    include /etc/nginx/npm-conf.d/*.conf;' "$nginx_conf"
@@ -530,6 +629,19 @@ create_data_dirs() {
     # 确保父目录存在并设置正确权限
     mkdir -p "$(dirname "$DATA_DIR")" "$(dirname "$NGINX_DATA_DIR")" "$(dirname "$LOG_DIR")"
     mkdir -p "$DATA_DIR" "$LOG_DIR"
+
+    # /data/ 目录需要 npm 用户写权限 (keys.json 写入 /data/keys.json)
+    # 如果补丁 001-keys-file-env.patch 应用成功，KEYS_FILE 环境变量会指向 /data/npm/keys.json
+    # 但作为兜底，确保 /data/ 本身也可写
+    chown "$NPM_USER:$NPM_GROUP" /data 2>/dev/null || true
+
+    # Let's Encrypt 凭证目录 (后端 setup.js 写入 /etc/letsencrypt/credentials/)
+    mkdir -p /etc/letsencrypt/credentials
+    chown -R "$NPM_USER:$NPM_GROUP" /etc/letsencrypt/credentials 2>/dev/null || true
+
+    # Nginx 默认站点目录 (后端 internal/nginx.js 引用 /data/nginx/default_host/site.conf)
+    mkdir -p "$NGINX_DATA_DIR/default_host"
+
     chown -R "$NPM_USER:$NPM_GROUP" "$DATA_DIR" "$LOG_DIR" 2>/dev/null || \
         warn "无法修改 $DATA_DIR 权限，可能已被挂载"
     log "数据: $DATA_DIR | 日志: $LOG_DIR"
@@ -554,6 +666,7 @@ WorkingDirectory=${NPM_DIR}/backend
 Environment=NODE_OPTIONS="--max-old-space-size=256"
 Environment=NODE_ENV=production
 Environment=DB_SQLITE_FILE=${DATA_DIR}/database.sqlite
+Environment=KEYS_FILE=${DATA_DIR}/keys.json
 Environment=DISABLE_IPV6=true
 Environment=IP_RANGES_FETCH_ENABLED=false
 ExecStart=${node_bin} index.js
@@ -574,6 +687,41 @@ WantedBy=multi-user.target
 SERVICE
 
     systemctl daemon-reload || true; log "Systemd 服务已创建 (node: $node_bin)"
+}
+
+configure_sudoers() {
+    section "配置 Nginx 权限"
+    # 后端以 npm 用户运行，需要 sudo 权限执行 nginx reload/test 和 logrotate
+    cat > /etc/sudoers.d/npm-backend << SUDOERS
+# NPM 后端需要重载和测试 Nginx 配置 (internal/nginx.js 通过 sudo 调用)
+npm ALL=(ALL) NOPASSWD: /usr/sbin/nginx -s reload
+npm ALL=(ALL) NOPASSWD: /usr/sbin/nginx -t *
+# NPM 后端需要执行 logrotate (setup.js)
+npm ALL=(ALL) NOPASSWD: /usr/sbin/logrotate /etc/logrotate.d/nginx-proxy-manager
+SUDOERS
+    chmod 440 /etc/sudoers.d/npm-backend
+    visudo -c &>/dev/null || warn "sudoers 语法检查失败，请检查 /etc/sudoers.d/npm-backend"
+    log "已配置 sudoers: npm 用户可执行 nginx reload/test 和 logrotate"
+}
+
+create_logrotate_config() {
+    section "配置 Logrotate"
+    cat > /etc/logrotate.d/nginx-proxy-manager << LOGROTATE
+/var/log/npm/*.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 $NPM_USER $NPM_GROUP
+    sharedscripts
+    postrotate
+        [ -f /var/run/nginx.pid ] && kill -USR1 \$(cat /var/run/nginx.pid) || true
+    endscript
+}
+LOGROTATE
+    log "Logrotate 配置已创建"
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -748,6 +896,9 @@ upgrade_npm() {
     # 重新加载环境变量
     load_env
 
+    # 重新应用裸机部署补丁 (上游更新可能覆盖了补丁修改)
+    apply_patches
+
     # 重新安装 Node 依赖
     cd "$NPM_DIR/backend"
     su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm install --no-audit --no-fund" || true
@@ -816,6 +967,8 @@ uninstall_keep() {
     systemctl stop npm-backend 2>/dev/null || true
     systemctl disable npm-backend 2>/dev/null || true
     rm -f /etc/systemd/system/npm-backend.service; systemctl daemon-reload || true; log "服务已移除"
+    rm -f /etc/sudoers.d/npm-backend 2>/dev/null || true; log "已移除 sudoers 配置"
+    rm -f /etc/logrotate.d/nginx-proxy-manager 2>/dev/null || true
     if [[ -d "$NGINX_CONF_DIR" ]]; then
         mkdir -p "$BACKUP_DIR/nginx-conf" 2>/dev/null || true
         cp -r "$NGINX_CONF_DIR" "$BACKUP_DIR/nginx-conf/" 2>/dev/null || true
@@ -832,6 +985,8 @@ uninstall_purge() {
     systemctl stop npm-backend 2>/dev/null || true
     systemctl disable npm-backend 2>/dev/null || true
     rm -f /etc/systemd/system/npm-backend.service; systemctl daemon-reload || true
+    rm -f /etc/sudoers.d/npm-backend 2>/dev/null || true
+    rm -f /etc/logrotate.d/nginx-proxy-manager 2>/dev/null || true
 
     [[ -d "$NPM_DIR" ]] && rm -rf "$NPM_DIR" && log "已删除安装目录"
     rm -rf "$NGINX_CONF_DIR" 2>/dev/null || true
@@ -906,7 +1061,12 @@ install_flow() {
             error "克隆失败，请检查网络后重试"; spacer; install_menu; return
         }
     }
+    # 确保源码目录归属 npm 用户 (git clone 以 root 执行)
+    chown -R "$NPM_USER:$NPM_GROUP" "$NPM_DIR" 2>/dev/null || true
     log "NPM 源码已就绪 ($NPM_DIR)"; spacer
+
+    # ─── 阶段 3.5: 应用裸机部署补丁 ────────────────────
+    apply_patches; spacer
 
     # ─── 阶段 4: 进入安装流程 ──────────────────────────
     run_install
@@ -942,8 +1102,8 @@ run_install() {
 
     install_deps; install_nodejs; create_user; install_node_deps
     build_frontend
-    configure_nginx; create_data_dirs; save_env
-    create_systemd_service
+    create_data_dirs; configure_nginx; save_env
+    create_systemd_service; configure_sudoers; create_logrotate_config
 
     section "启动服务"
     systemctl enable nginx 2>/dev/null || true; systemctl start nginx 2>/dev/null || true

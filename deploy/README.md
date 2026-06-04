@@ -6,7 +6,7 @@
 
 **一行命令（推荐）：**
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/zczy-k/nginx-proxy-manager/develop/deploy/setup.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/zczy-k/nginx-proxy-manager/develop/deploy/setup.sh)
 ```
 
 或者使用 git clone：
@@ -14,7 +14,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zczy-k/nginx-proxy-manager/d
 git clone --depth 1 https://github.com/zczy-k/nginx-proxy-manager.git /opt/nginx-proxy-manager && sudo bash /opt/nginx-proxy-manager/deploy/setup.sh
 ```
 
-> 运行后进入交互式菜单，所有操作通过数字选择完成。
+> 运行后直接进入交互式菜单，所有操作通过数字选择完成。
 
 ## 特性
 

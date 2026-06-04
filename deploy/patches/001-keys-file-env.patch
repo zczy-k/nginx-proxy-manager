@@ -1,0 +1,10 @@
+--- a/backend/lib/config.js
++++ b/backend/lib/config.js
+@@ -3,7 +3,7 @@
+ import { global as logger } from "../logger.js";
+
+-const keysFile               = '/data/keys.json';
++const keysFile               = process.env.KEYS_FILE || '/data/keys.json';
+ const mysqlEngine            = 'mysql2';
+ const postgresEngine         = 'pg';
+ const sqliteClientName       = 'better-sqlite3';
