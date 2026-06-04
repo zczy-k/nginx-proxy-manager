@@ -6,7 +6,7 @@
 
 **一行命令（推荐）：**
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/zczy-k/nginx-proxy-manager/develop/deploy/setup.sh)
+curl -fsSL https://raw.githubusercontent.com/zczy-k/nginx-proxy-manager/develop/deploy/setup.sh | sudo bash
 ```
 
 或者使用 git clone：
