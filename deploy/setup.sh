@@ -291,15 +291,20 @@ cleanup_old_install() {
 
     # 停用服务
     if systemctl is-active npm-backend &>/dev/null 2>&1 || [[ -f /etc/systemd/system/npm-backend.service ]]; then
-        systemctl stop npm-backend 2>/dev/null || true; systemctl disable npm-backend 2>/dev/null || true
-        rm -f /etc/systemd/system/npm-backend.service; systemctl daemon-reload; cleaned=true
+        systemctl stop npm-backend 2>/dev/null || true
+        systemctl disable npm-backend 2>/dev/null || true
+        rm -f /etc/systemd/system/npm-backend.service
+        systemctl daemon-reload 2>/dev/null || true
+        cleaned=true
         log "已停用并删除 npm-backend 服务"
     fi
 
     # Docker 容器
     if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qi "nginx-proxy-manager\|npm"; then
-        docker stop nginx-proxy-manager 2>/dev/null || true; docker rm nginx-proxy-manager 2>/dev/null || true
-        cleaned=true; log "已清理 Docker 容器"
+        docker stop nginx-proxy-manager 2>/dev/null || true
+        docker rm nginx-proxy-manager 2>/dev/null || true
+        cleaned=true
+        log "已清理 Docker 容器"
     fi
 
     # 删除安装目录（仅强制模式）
@@ -311,20 +316,27 @@ cleanup_old_install() {
 
     # 删除数据目录
     if [[ -d "$DATA_DIR" ]]; then
-        if $force; then rm -rf "$DATA_DIR"; cleaned=true; log "已删除数据: $DATA_DIR"
-        else confirm "删除数据目录 $DATA_DIR？" "n" && rm -rf "$DATA_DIR" && cleaned=true && log "已删除数据" || true; fi
+        if $force; then
+            rm -rf "$DATA_DIR" 2>/dev/null || true
+            cleaned=true
+            log "已删除数据: $DATA_DIR"
+        else
+            confirm "删除数据目录 $DATA_DIR？" "n" && rm -rf "$DATA_DIR" 2>/dev/null && cleaned=true && log "已删除数据" || true
+        fi
     fi
 
     # 删除 Nginx 配置
     if [[ -d "$NGINX_CONF_DIR" ]]; then
-        rm -rf "$NGINX_CONF_DIR"; cleaned=true; log "已清理 Nginx 配置"
+        rm -rf "$NGINX_CONF_DIR" 2>/dev/null || true
+        cleaned=true
+        log "已清理 Nginx 配置"
     fi
     sed -i '/npm-conf\.d/d' /etc/nginx/nginx.conf 2>/dev/null || true
     systemctl reload nginx 2>/dev/null || true
 
     # 删除日志
     if [[ -d "$LOG_DIR" ]]; then
-        $force && rm -rf "$LOG_DIR" && log "已删除日志" || true
+        $force && rm -rf "$LOG_DIR" 2>/dev/null && log "已删除日志" || true
     fi
 
     $cleaned && log "旧安装已完全清理" || info "无残留"
@@ -336,7 +348,7 @@ cleanup_old_install() {
 
 install_deps() {
     section "安装系统依赖"
-    apt-get update -qq
+    apt-get update -qq || true
     # 系统包推荐安装 (包括 certbot 所需的推荐依赖)
     apt-get install -y \
         nginx certbot python3 python3-certbot-nginx \
@@ -353,8 +365,8 @@ install_nodejs() {
         fi
         info "当前 $ver，升级到 $NODE_VERSION ..."
     fi
-    curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | bash - > /dev/null
-    apt-get update -qq > /dev/null
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | bash - > /dev/null || true
+    apt-get update -qq > /dev/null || true
     apt-get install -y nodejs > /dev/null
     log "Node.js $(node --version) 安装完成"
 }
@@ -561,7 +573,7 @@ ProtectControlGroups=true
 WantedBy=multi-user.target
 SERVICE
 
-    systemctl daemon-reload; log "Systemd 服务已创建 (node: $node_bin)"
+    systemctl daemon-reload || true; log "Systemd 服务已创建 (node: $node_bin)"
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -764,7 +776,7 @@ upgrade_npm() {
 
     spacer
     section "重启服务"
-    systemctl daemon-reload
+    systemctl daemon-reload || true
     systemctl restart npm-backend 2>/dev/null || true
     sleep 2
 
@@ -803,10 +815,11 @@ uninstall_keep() {
     confirm "确认保留数据并卸载？" "n" || return
     systemctl stop npm-backend 2>/dev/null || true
     systemctl disable npm-backend 2>/dev/null || true
-    rm -f /etc/systemd/system/npm-backend.service; systemctl daemon-reload; log "服务已移除"
+    rm -f /etc/systemd/system/npm-backend.service; systemctl daemon-reload || true; log "服务已移除"
     if [[ -d "$NGINX_CONF_DIR" ]]; then
-        mkdir -p "$BACKUP_DIR/nginx-conf"; cp -r "$NGINX_CONF_DIR" "$BACKUP_DIR/nginx-conf/"
-        rm -rf "$NGINX_CONF_DIR"; log "Nginx 配置已备份到 $BACKUP_DIR/nginx-conf 并移除"
+        mkdir -p "$BACKUP_DIR/nginx-conf" 2>/dev/null || true
+        cp -r "$NGINX_CONF_DIR" "$BACKUP_DIR/nginx-conf/" 2>/dev/null || true
+        rm -rf "$NGINX_CONF_DIR" 2>/dev/null || true; log "Nginx 配置已备份到 $BACKUP_DIR/nginx-conf 并移除"
     fi
     sed -i '/npm-conf\.d/d' /etc/nginx/nginx.conf 2>/dev/null || true
     systemctl reload nginx 2>/dev/null || true
@@ -818,10 +831,10 @@ uninstall_purge() {
     confirm "确认完全卸载（所有数据将被删除）？" "n" || return
     systemctl stop npm-backend 2>/dev/null || true
     systemctl disable npm-backend 2>/dev/null || true
-    rm -f /etc/systemd/system/npm-backend.service; systemctl daemon-reload
+    rm -f /etc/systemd/system/npm-backend.service; systemctl daemon-reload || true
 
     [[ -d "$NPM_DIR" ]] && rm -rf "$NPM_DIR" && log "已删除安装目录"
-    rm -rf "$NGINX_CONF_DIR"
+    rm -rf "$NGINX_CONF_DIR" 2>/dev/null || true
     sed -i '/npm-conf\.d/d' /etc/nginx/nginx.conf 2>/dev/null || true
     systemctl reload nginx 2>/dev/null || true; log "已清理 Nginx 配置"
     [[ -d "$DATA_DIR" ]] && rm -rf "$DATA_DIR" && log "已删除数据"
@@ -905,8 +918,8 @@ run_install() {
     create_systemd_service
 
     section "启动服务"
-    systemctl enable nginx; systemctl start nginx || true
-    systemctl enable npm-backend; systemctl start npm-backend || true
+    systemctl enable nginx 2>/dev/null || true; systemctl start nginx 2>/dev/null || true
+    systemctl enable npm-backend 2>/dev/null || true; systemctl start npm-backend 2>/dev/null || true
     sleep 3
     systemctl is-active npm-backend &>/dev/null && log "后端已启动" || warn "后端启动失败，查看日志: journalctl -u npm-backend -n 30"
 
