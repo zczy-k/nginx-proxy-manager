@@ -866,24 +866,66 @@ show_status() {
 # 安装主流程
 # ═══════════════════════════════════════════════════════════════
 
+install_flow() {
+    local force=$1
+    check_root; load_env
+
+    # ─── 阶段 1: 平台检测 ───────────────────────────────
+    section "平台检测"
+    detect_os; detect_arch; spacer
+
+    # ─── 阶段 2: 检测并清理旧残留 ──────────────────────
+    local has_traces=false
+    detect_existing_npm && has_traces=true
+
+    if $force || $has_traces; then
+        if $force; then
+            warn "强制清理所有旧安装残留..."
+            cleanup_old_install true
+        else
+            warn "发现旧安装残留"
+            if confirm "是否清理所有旧残留（源码/数据/配置）？" "y"; then
+                cleanup_old_install true
+            else
+                info "跳过清理，但保留旧安装可能导致冲突"
+            fi
+        fi
+        spacer
+    fi
+
+    # ─── 阶段 3: 下载最新源码 ───────────────────────────
+    section "准备 NPM 源码"
+    if [[ -d "$NPM_DIR" ]]; then
+        info "清理旧的 NPM 源码目录..."
+        rm -rf "$NPM_DIR" 2>/dev/null || true
+    fi
+    info "正在从 GitHub 克隆仓库 ..."
+    git clone --depth 1 -b develop "$GIT_REPO" "$NPM_DIR" 2>/dev/null || {
+        warn "主仓库失败，尝试备用上游 ..."
+        git clone --depth 1 -b develop "$UPSTREAM_REPO" "$NPM_DIR" 2>/dev/null || {
+            error "克隆失败，请检查网络后重试"; spacer; install_menu; return
+        }
+    }
+    log "NPM 源码已就绪 ($NPM_DIR)"; spacer
+
+    # ─── 阶段 4: 进入安装流程 ──────────────────────────
+    run_install
+}
+
 run_install() {
-    check_root
-    print_banner; load_env
+    print_banner
     header "Nginx Proxy Manager 安装向导"
     info "本工具将自动补全缺失依赖，在不干扰现有服务的前提下安装 NPM\n"
 
-    section "第一步: 环境检测"
-    detect_os; detect_arch; spacer
-
-    section "第二步: 冲突检测"
+    section "冲突检测"
     local has_ports=false
     detect_port_conflicts && has_ports=true; detect_nginx_conflicts; spacer
 
-    section "第三步: 端口配置"
+    section "端口配置"
     configure_ports; spacer
 
     if $has_ports; then
-        section "第四步: 冲突解决"
+        section "冲突解决"
         confirm "自动解决端口冲突？" "y" && resolve_port_conflicts || true
         spacer
     fi
@@ -898,20 +940,6 @@ run_install() {
 
     spacer; header "开始安装"
 
-    # 确保 NPM 源码存在（清除旧安装后或首次运行）
-    if [[ ! -d "$NPM_DIR/backend" ]]; then
-        section "准备 NPM 源码"
-        info "未找到源码目录，正在克隆仓库 ..."
-        git clone --depth 1 -b develop "$GIT_REPO" "$NPM_DIR" 2>/dev/null || {
-            warn "克隆主仓库失败，尝试备用上游 ..."
-            git clone --depth 1 -b develop "$UPSTREAM_REPO" "$NPM_DIR" 2>/dev/null || {
-                error "克隆失败，请检查网络后重试"; exit 1
-            }
-        }
-        log "NPM 源码已就绪 ($NPM_DIR)"
-    fi
-
-    # 自动补齐缺失的系统依赖和 Node.js
     install_deps; install_nodejs; create_user; install_node_deps
     build_frontend
     configure_nginx; create_data_dirs; save_env
@@ -956,24 +984,18 @@ run_install() {
 install_menu() {
     print_banner
     header "安装 Nginx Proxy Manager"
-    echo -e "  ${BOLD}1${NC}. 全新安装（检测并清理旧残留后安装）"
+    echo -e "  ${BOLD}1${NC}. 全新安装（检测平台 → 清理旧残留 → 下载源码 → 安装）"
     echo -e "  ${BOLD}2${NC}. 强制重装（先完全卸载旧版，清理所有残留，再全新安装）"
     echo -e "  ${BOLD}3${NC}. 返回主菜单"
     spacer
     read -r -p "$(echo -e "${YELLOW}?${NC} 请选择 [1-3]: ")" choice
     case "$choice" in
         1)
-            # 全新安装：检测旧版，引导清理
-            detect_existing_npm && confirm "检测到旧安装，是否先清理？" "y" && cleanup_old_install false
-            run_install
+            install_flow false
             ;;
         2)
-            # 强制重装：不询问直接清除所有
             if confirm "将完全卸载现有版本并删除所有数据，确认？" "n"; then
-                warn "正在强制清理所有旧安装..."; spacer
-                cleanup_old_install true
-                log "旧版已完全清除，开始重新安装"; spacer
-                run_install
+                install_flow true
             else
                 info "已取消"; install_menu
             fi
