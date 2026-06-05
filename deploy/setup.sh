@@ -591,18 +591,30 @@ include /data/nginx/temp/*.conf;
 HTTP_TOP
     chown "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR/custom/http_top.conf"
 
-    # 默认站点
+    # 禁用 Ubuntu 默认站点，避免与 NPM 配置冲突 (default_server 冲突)
+    if [[ -f /etc/nginx/sites-enabled/default ]]; then
+        rm -f /etc/nginx/sites-enabled/default
+        log "已禁用 Ubuntu 默认站点 (sites-enabled/default)"
+    fi
+
+    # 默认站点 (不加 default_server，由用户自定义或 NPM 后端生成)
     if [[ ! -f "$NGINX_DATA_DIR/default_host/site.conf" ]]; then
         cat > "$NGINX_DATA_DIR/default_host/site.conf" << 'EOF'
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
+    listen 80;
+    listen [::]:80;
     server_name _;
     root /var/www/html;
     location / { try_files $uri $uri/ =404; }
 }
 EOF
         chown "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR/default_host/site.conf"
+    else
+        # 修正旧版本遗留的 default_server (会导致 nginx -t 失败)
+        if grep -q 'default_server' "$NGINX_DATA_DIR/default_host/site.conf" 2>/dev/null; then
+            sed -i 's/ default_server//g' "$NGINX_DATA_DIR/default_host/site.conf"
+            log "已移除 default_host/site.conf 中的 default_server"
+        fi
     fi
 
     # 复制 Docker 内置的 nginx include 片段 (conf.d/include/*.conf)
