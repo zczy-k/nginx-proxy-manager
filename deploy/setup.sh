@@ -1036,7 +1036,24 @@ run_install() {
     local has_conflicts=false
     detect_port_conflicts && has_conflicts=true || true
     detect_nginx_conflicts; detect_nodejs || true; detect_certbot; spacer
-    section "遗留清理"; detect_existing_npm && confirm "清理旧安装？" "y" && cleanup_old_install; spacer
+    section "遗留清理"; detect_existing_npm && confirm "清理旧安装？" "y" && cleanup_old_install
+    # 检测旧数据库: 保留则用原账号登录, 清除则全新注册
+    if [[ -f "$DATA_DIR/database.sqlite" ]]; then
+        local db_size; db_size=$(du -sh "$DATA_DIR/database.sqlite" 2>/dev/null | cut -f1)
+        warn "发现旧数据库: $DATA_DIR/database.sqlite ($db_size)"
+        warn "保留 = 使用原账号登录 | 清除 = 全新安装可重新注册"
+        if confirm "是否清除所有旧数据 (数据库 / SSL证书 / 代理配置)？" "n"; then
+            rm -rf "$DATA_DIR" 2>/dev/null || true
+            rm -rf "$NGINX_DATA_DIR"/{proxy_host,redirection_host,stream,dead_host} 2>/dev/null || true
+            rm -rf /data/logs /data/custom_ssl /data/access /data/letsencrypt-acme-challenge 2>/dev/null || true
+            rm -f /data/keys.json 2>/dev/null || true
+            log "旧数据已清除"
+        else
+            info "保留旧数据，安装后使用原账号登录"
+        fi
+        spacer
+    fi
+    spacer
     section "端口配置"; configure_ports; spacer
 
     if $has_conflicts; then
