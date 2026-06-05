@@ -62,7 +62,14 @@ spinner() {
     while kill -0 "$pid" 2>/dev/null; do
         for i in $(seq 0 3); do echo -ne "\b${spin:$i:1}"; sleep 0.1; done
     done
-    echo -e "\b${GREEN}✓${NC}"
+    local exit_code=0
+    wait "$pid" 2>/dev/null || exit_code=$?
+    if [[ $exit_code -eq 0 ]]; then
+        echo -e "\b${GREEN}✓${NC}"
+    else
+        echo -e "\b${RED}✗${NC}"
+    fi
+    return $exit_code
 }
 
 confirm() {
@@ -259,6 +266,9 @@ cleanup_old_install() {
         systemctl daemon-reload; log "已清理 systemd 服务"
     }
     [[ -d "$NGINX_CONF_DIR" ]] && { rm -rf "$NGINX_CONF_DIR"; log "已清理 Nginx 配置"; }
+    [[ -d /etc/nginx/conf.d/include ]] && { rm -rf /etc/nginx/conf.d/include; log "已清理 Nginx include 片段"; }
+    sed -i '/data\/nginx\/stream/d' /etc/nginx/nginx.conf 2>/dev/null || true
+    sed -i '/log-stream\.conf/d' /etc/nginx/nginx.conf 2>/dev/null || true
     # 清理旧 wrapper
     dpkg-divert --list 2>/dev/null | grep -q "/usr/sbin/nginx" && {
         rm -f /usr/sbin/nginx; dpkg-divert --remove --rename /usr/sbin/nginx 2>/dev/null || true
@@ -275,6 +285,7 @@ install_dependencies() {
     apt-get install -y --no-install-recommends \
         nginx certbot python3 python3-venv python3-certbot-nginx \
         git curl jq logrotate ca-certificates sqlite3 lsof sudo \
+        build-essential \
         > /dev/null
     log "系统依赖安装完成"
 
@@ -352,7 +363,7 @@ install_node_deps() {
     cd "$NPM_DIR/backend"
     info "安装 npm 依赖 ..."
     su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm install --no-audit --no-fund" &
-    spinner $! "npm install"
+    spinner $! "npm install" || { error "npm install 失败 (可能缺少编译工具)"; return 1; }
     # 移除不需要的数据库驱动 (--no-save 确保不修改 package.json)
     su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm uninstall mysql2 pg sqlite3 --no-save --no-audit --no-fund" 2>/dev/null || true
     log "依赖安装完成 (已清理多余 DB 驱动)"
@@ -366,7 +377,7 @@ build_frontend() {
     }
     info "安装前端依赖 ..."
     su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/frontend' && npm install --no-audit --no-fund" &
-    spinner $! "npm install (frontend)"
+    spinner $! "npm install (frontend)" || { error "前端依赖安装失败"; return 1; }
     info "构建前端 (在 2C1G 服务器上可能需要 3-5 分钟) ..."
     su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/frontend' && npm run build" 2>&1 | tail -20 || {
         error "前端构建失败"; info "可能内存不足，关闭其他服务后重试"; return 1
@@ -382,14 +393,29 @@ create_data_dirs() {
     chown "$NPM_USER:$NPM_GROUP" /data 2>/dev/null || true
     # 后端模板引用的运行时目录
     mkdir -p /data/logs /data/custom_ssl /data/access /data/nginx/default_www
+    mkdir -p /data/letsencrypt-acme-challenge
     mkdir -p "$NGINX_DATA_DIR"/{custom,proxy_host,redirection_host,stream,dead_host,temp,default_host}
-    chown "$NPM_USER:$NPM_GROUP" /data/logs /data/custom_ssl /data/access
+    chown "$NPM_USER:$NPM_GROUP" /data/logs /data/custom_ssl /data/access /data/letsencrypt-acme-challenge
     chown -R "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR" "$DATA_DIR" "$LOG_DIR"
-    # Let's Encrypt 凭证
-    mkdir -p /etc/letsencrypt/credentials
-    chown -R "$NPM_USER:$NPM_GROUP" /etc/letsencrypt/credentials 2>/dev/null || true
-    # certbot 配置文件占位
-    [[ -f /etc/letsencrypt.ini ]] || { touch /etc/letsencrypt.ini; chown "$NPM_USER:$NPM_GROUP" /etc/letsencrypt.ini; }
+    # Let's Encrypt (certbot 需要完整目录权限)
+    mkdir -p /etc/letsencrypt/credentials /etc/letsencrypt/live /etc/letsencrypt/archive /etc/letsencrypt/renewal /etc/letsencrypt/accounts
+    chown -R "$NPM_USER:$NPM_GROUP" /etc/letsencrypt 2>/dev/null || true
+    # certbot 配置文件 (从 Docker rootfs 复制或手动生成)
+    if [[ ! -f /etc/letsencrypt.ini ]] || [[ ! -s /etc/letsencrypt.ini ]]; then
+        if [[ -f "$NPM_DIR/docker/rootfs/etc/letsencrypt.ini" ]]; then
+            cp "$NPM_DIR/docker/rootfs/etc/letsencrypt.ini" /etc/letsencrypt.ini
+        else
+            cat > /etc/letsencrypt.ini << 'LE_INI'
+text = True
+non-interactive = True
+webroot-path = /data/letsencrypt-acme-challenge
+key-type = ecdsa
+elliptic-curve = secp384r1
+preferred-chain = ISRG Root X1
+LE_INI
+        fi
+        chown "$NPM_USER:$NPM_GROUP" /etc/letsencrypt.ini
+    fi
     log "数据目录创建完成"
 }
 
@@ -441,8 +467,29 @@ server {
 }
 NGINX_CONF
 
-    # http_top 占位
-    [[ -f "$NGINX_DATA_DIR/custom/http_top.conf" ]] || touch "$NGINX_DATA_DIR/custom/http_top.conf"
+    # NPM http 级配置 (map / cache / log_format)
+    cat > "$NGINX_DATA_DIR/custom/http_top.conf" << 'HTTP_TOP'
+# --- NPM Bare-Metal: http-level configuration ---
+# Log formats (referenced by backend-generated configs)
+log_format proxy '[$time_local] $upstream_cache_status $upstream_status $status - $request_method $scheme $host "$request_uri" [Client $remote_addr] [Length $body_bytes_sent] [Gzip $gzip_ratio] [Sent-to $server] "$http_user_agent" "$http_referer"';
+log_format standard '[$time_local] $status - $request_method $scheme $host "$request_uri" [Client $remote_addr] [Length $body_bytes_sent] [Gzip $gzip_ratio] "$http_user_agent" "$http_referer"';
+
+# Proxy cache zones (referenced by conf.d/include/assets.conf)
+proxy_cache_path /var/lib/nginx/cache/public  levels=1:2 keys_zone=public-cache:30m  max_size=192m;
+proxy_cache_path /var/lib/nginx/cache/private levels=1:2 keys_zone=private-cache:5m max_size=1024m;
+
+# NPM template variables
+map $host $forward_scheme { default http; }
+map $http_x_forwarded_proto $x_forwarded_proto { "http" "http"; "https" "https"; default $scheme; }
+map $http_x_forwarded_scheme $x_forwarded_scheme { "http" "http"; "https" "https"; default $scheme; }
+
+# NPM backend-generated proxy configs
+include /data/nginx/default_host/*.conf;
+include /data/nginx/proxy_host/*.conf;
+include /data/nginx/redirection_host/*.conf;
+include /data/nginx/dead_host/*.conf;
+include /data/nginx/temp/*.conf;
+HTTP_TOP
     chown "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR/custom/http_top.conf"
 
     # 默认站点
@@ -459,15 +506,48 @@ EOF
         chown "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR/default_host/site.conf"
     fi
 
+    # 复制 Docker 内置的 nginx include 片段 (conf.d/include/*.conf)
+    # 后端模板通过 include conf.d/include/proxy.conf 等引用这些文件
+    local include_dir="/etc/nginx/conf.d/include"
+    mkdir -p "$include_dir"
+    local docker_include_dir="$NPM_DIR/docker/rootfs/etc/nginx/conf.d/include"
+    if [[ -d "$docker_include_dir" ]]; then
+        for f in "$docker_include_dir"/*.conf; do
+            [[ -f "$f" ]] && cp "$f" "$include_dir/"
+        done
+        log "已复制 Docker nginx include 片段到 $include_dir"
+    else
+        warn "未找到 Docker include 目录: $docker_include_dir"
+    fi
+    # 创建空的 resolvers.conf (Docker 启动时动态生成，裸机用占位文件)
+    [[ -f "$include_dir/resolvers.conf" ]] || touch "$include_dir/resolvers.conf"
+    # 创建空的 ip_ranges.conf (后端运行时填充)
+    [[ -f "$include_dir/ip_ranges.conf" ]] || touch "$include_dir/ip_ranges.conf"
+    # 创建 nginx cache 目录
+    mkdir -p /var/lib/nginx/cache/public /var/lib/nginx/cache/private
+    chown -R www-data:www-data /var/lib/nginx/cache 2>/dev/null || true
+
     # 注入 include (兼容不同 nginx.conf 格式)
     local nc="/etc/nginx/nginx.conf"
-    if [[ -f "$nc" ]] && ! grep -q "npm-conf.d" "$nc" 2>/dev/null; then
-        if grep -qE '^\s*http\s*\{' "$nc"; then
-            sed -i '/^\s*http\s*{/a\    include /etc/nginx/npm-conf.d/*.conf;' "$nc"
-            sed -i '/^\s*http\s*{/a\    include /data/nginx/custom/http_top.conf;' "$nc"
-            log "已注入 NPM include"
-        else
-            warn "未找到 http {} 块，请手动添加 include 指令"
+    if [[ -f "$nc" ]]; then
+        if ! grep -q "npm-conf.d" "$nc" 2>/dev/null; then
+            if grep -qE '^\s*http\s*\{' "$nc"; then
+                sed -i '/^\s*http\s*{/a\    include /etc/nginx/npm-conf.d/*.conf;' "$nc"
+                sed -i '/^\s*http\s*{/a\    include /data/nginx/custom/http_top.conf;' "$nc"
+                log "已注入 NPM http include"
+            else
+                warn "未找到 http {} 块，请手动添加 include 指令"
+            fi
+        fi
+        # stream 块 (TCP/UDP 代理)
+        if ! grep -q '/data/nginx/stream' "$nc" 2>/dev/null; then
+            if grep -qE '^\s*stream\s*\{' "$nc"; then
+                sed -i '/^\s*stream\s*{/a\    include /data/nginx/stream/*.conf;' "$nc"
+                sed -i '/^\s*stream\s*{/a\    include /etc/nginx/conf.d/include/log-stream.conf;' "$nc"
+                log "已注入 NPM stream include"
+            else
+                info "nginx.conf 无 stream 块 (跳过 TCP/UDP 代理支持)"
+            fi
         fi
     fi
 
@@ -497,10 +577,8 @@ Environment=DB_SQLITE_FILE=${DATA_DIR}/database.sqlite
 Environment=DISABLE_IPV6=true
 Environment=IP_RANGES_FETCH_ENABLED=false
 ExecStart=/usr/bin/node index.js
-ExecReload=/bin/kill -SIGTERM \$MAINPID
 Restart=on-failure
 RestartSec=5
-NoNewPrivileges=true
 ProtectHome=true
 ProtectSystem=full
 PrivateTmp=true
@@ -541,7 +619,7 @@ create_logrotate() {
     create 0640 $NPM_USER $NPM_GROUP
     sharedscripts
     postrotate
-        [ -f /var/run/nginx.pid ] && kill -USR1 \$(cat /var/run/nginx.pid) || true
+        /usr/sbin/nginx -s reopen 2>/dev/null || true
     endscript
 }
 LOGROTATE
@@ -634,6 +712,9 @@ _uninstall_common() {
     [[ -d "$NGINX_CONF_DIR" ]] && rm -rf "$NGINX_CONF_DIR"
     sed -i '/npm-conf\.d/d' /etc/nginx/nginx.conf 2>/dev/null || true
     sed -i '/http_top\.conf/d' /etc/nginx/nginx.conf 2>/dev/null || true
+    sed -i '/data\/nginx\/stream/d' /etc/nginx/nginx.conf 2>/dev/null || true
+    sed -i '/log-stream\.conf/d' /etc/nginx/nginx.conf 2>/dev/null || true
+    [[ -d /etc/nginx/conf.d/include ]] && rm -rf /etc/nginx/conf.d/include
     systemctl reload nginx 2>/dev/null || true
     dpkg-divert --list 2>/dev/null | grep -q "/usr/sbin/nginx" && {
         rm -f /usr/sbin/nginx; dpkg-divert --remove --rename /usr/sbin/nginx 2>/dev/null || true
@@ -674,26 +755,33 @@ upgrade_npm() {
     git remote get-url upstream &>/dev/null || git remote add upstream "$UPSTREAM_REPO"
 
     local branch="develop"
+
+    # 停止后端 (防止数据库迁移冲突)
+    section "停止后端服务"
+    systemctl stop npm-backend 2>/dev/null || true
+    log "后端已停止"
+
     case "$mode" in
-        1) info "从 origin 拉取..."; git fetch origin "$branch" && git merge "origin/$branch" --no-edit ;;
-        2) info "从 upstream 拉取..."; git fetch upstream "$branch" && git merge "upstream/$branch" --no-edit ;;
-        3) return ;; *) warn "无效"; return ;;
+        1) info "从 origin 拉取..."; git fetch origin "$branch" && git merge "origin/$branch" --no-edit || { error "合并失败"; systemctl start npm-backend 2>/dev/null || true; return 1; } ;;
+        2) info "从 upstream 拉取..."; git fetch upstream "$branch" && git merge "upstream/$branch" --no-edit || { error "合并失败"; systemctl start npm-backend 2>/dev/null || true; return 1; } ;;
+        3) systemctl start npm-backend 2>/dev/null || true; return ;;
+        *) warn "无效"; systemctl start npm-backend 2>/dev/null || true; return ;;
     esac
 
     section "重新安装依赖"
     cd "$NPM_DIR/backend"
     su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm install --no-audit --no-fund" &
-    spinner $! "npm install (backend)"
+    spinner $! "npm install (backend)" || { error "后端依赖安装失败"; systemctl start npm-backend 2>/dev/null || true; return 1; }
     su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm uninstall mysql2 pg sqlite3 --no-save --no-audit --no-fund" 2>/dev/null || true
 
     section "重新构建前端"
     rm -rf "$NPM_DIR/frontend/dist" 2>/dev/null || true
     su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/frontend' && npm install --no-audit --no-fund" &
-    spinner $! "npm install (frontend)"
-    su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/frontend' && npm run build" 2>&1 | tail -10 || { error "前端构建失败"; return 1; }
+    spinner $! "npm install (frontend)" || { error "前端依赖安装失败"; systemctl start npm-backend 2>/dev/null || true; return 1; }
+    su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/frontend' && npm run build" 2>&1 | tail -10 || { error "前端构建失败"; systemctl start npm-backend 2>/dev/null || true; return 1; }
 
     section "重启服务"
-    systemctl restart npm-backend
+    systemctl start npm-backend
     sleep 5
     systemctl is-active npm-backend &>/dev/null && log "升级完成" || warn "后端未就绪，检查日志"
 }
@@ -708,43 +796,43 @@ health_check() {
 
     # 1. systemd 服务
     echo -n "  后端服务:    "
-    if systemctl is-active npm-backend &>/dev/null; then echo -e "${GREEN}运行中${NC}"; ((pass++))
-    else echo -e "${RED}未运行${NC}"; ((fail++)); fi
+    if systemctl is-active npm-backend &>/dev/null; then echo -e "${GREEN}运行中${NC}"; pass=$((pass + 1))
+    else echo -e "${RED}未运行${NC}"; fail=$((fail + 1)); fi
 
     # 2. Nginx
     echo -n "  Nginx:       "
-    if systemctl is-active nginx &>/dev/null; then echo -e "${GREEN}运行中${NC}"; ((pass++))
-    else echo -e "${RED}未运行${NC}"; ((fail++)); fi
+    if systemctl is-active nginx &>/dev/null; then echo -e "${GREEN}运行中${NC}"; pass=$((pass + 1))
+    else echo -e "${RED}未运行${NC}"; fail=$((fail + 1)); fi
 
     # 3. Wrapper
     echo -n "  Nginx Wrapper: "
     if [[ -f /usr/sbin/nginx.real ]] && dpkg-divert --list 2>/dev/null | grep -q "/usr/sbin/nginx"; then
-        echo -e "${GREEN}已安装${NC}"; ((pass++))
-    else echo -e "${RED}未安装${NC}"; ((fail++)); fi
+        echo -e "${GREEN}已安装${NC}"; pass=$((pass + 1))
+    else echo -e "${RED}未安装${NC}"; fail=$((fail + 1)); fi
 
     # 4. 管理端口
     echo -n "  管理端口 $PORT_ADMIN: "
-    if ss -tlnp "sport = :$PORT_ADMIN" 2>/dev/null | grep -q LISTEN; then echo -e "${GREEN}监听中${NC}"; ((pass++))
-    else echo -e "${RED}未监听${NC}"; ((fail++)); fi
+    if ss -tlnp "sport = :$PORT_ADMIN" 2>/dev/null | grep -q LISTEN; then echo -e "${GREEN}监听中${NC}"; pass=$((pass + 1))
+    else echo -e "${RED}未监听${NC}"; fail=$((fail + 1)); fi
 
     # 5. HTTP 响应
     echo -n "  HTTP 响应:   "
     local http_code
     http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT_ADMIN}/" 2>/dev/null) || http_code="000"
-    if [[ "$http_code" == "200" ]]; then echo -e "${GREEN}200 OK${NC}"; ((pass++))
-    else echo -e "${RED}$http_code${NC}"; ((fail++)); fi
+    if [[ "$http_code" == "200" ]]; then echo -e "${GREEN}200 OK${NC}"; pass=$((pass + 1))
+    else echo -e "${RED}$http_code${NC}"; fail=$((fail + 1)); fi
 
     # 6. SQLite
     echo -n "  SQLite DB:   "
     if [[ -f "$DATA_DIR/database.sqlite" ]]; then
         local size; size=$(du -sh "$DATA_DIR/database.sqlite" 2>/dev/null | cut -f1)
-        echo -e "${GREEN}存在 ($size)${NC}"; ((pass++))
-    else echo -e "${YELLOW}不存在 (首次启动后创建)${NC}"; ((pass++)); fi
+        echo -e "${GREEN}存在 ($size)${NC}"; pass=$((pass + 1))
+    else echo -e "${YELLOW}不存在 (首次启动后创建)${NC}"; pass=$((pass + 1)); fi
 
     # 7. Nginx 语法
     echo -n "  Nginx 语法:  "
-    if nginx -t 2>/dev/null; then echo -e "${GREEN}通过${NC}"; ((pass++))
-    else echo -e "${RED}错误${NC}"; ((fail++)); fi
+    if nginx -t 2>/dev/null; then echo -e "${GREEN}通过${NC}"; pass=$((pass + 1))
+    else echo -e "${RED}错误${NC}"; fail=$((fail + 1)); fi
 
     spacer
     echo -e "  结果: ${GREEN}$pass/$total 通过${NC}  ${RED}${fail} 失败${NC}"
