@@ -3,7 +3,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="4.0.1"
-APP_LABEL="Nginx Proxy Manager Bare Metal"
+APP_LABEL="Nginx Proxy Manager 裸机部署"
 APP_USER="npmbare"
 APP_GROUP="npmbare"
 
@@ -75,7 +75,7 @@ usage() {
     cat <<EOF
 $APP_LABEL v$SCRIPT_VERSION
 
-Usage:
+用法:
   setup.sh install [--admin-port PORT] [--ref REF] [--node VERSION] [--yes]
   setup.sh install-local [--admin-port PORT] [--ref REF] [--node VERSION] [--yes]
   setup.sh reinstall [--admin-port PORT] [--ref REF] [--node VERSION] [--yes]
@@ -130,7 +130,7 @@ parse_args() {
                 exit 0
                 ;;
             *)
-                die "Unknown argument: $1"
+                die "未知参数：$1"
                 ;;
         esac
     done
@@ -141,20 +141,20 @@ print_banner() {
     cat <<EOF
 ${CYAN}${BOLD}
   Nginx Proxy Manager
-  Bare-Metal Deployer v${SCRIPT_VERSION}
+  裸机部署器 v${SCRIPT_VERSION}
 ${NC}
-${DIM}Private runtime, private nginx instance, no source patching${NC}
+${DIM}私有运行时、私有 nginx 实例、不修改上游源码${NC}
 EOF
 }
 
 require_root() {
     if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-        die "Please run this script as root"
+        die "请使用 root 身份运行此脚本"
     fi
 }
 
 require_linux() {
-    [[ "$(uname -s)" == "Linux" ]] || die "This deployer only supports Linux"
+    [[ "$(uname -s)" == "Linux" ]] || die "此部署脚本仅支持 Linux"
 }
 
 ensure_tty() {
@@ -198,18 +198,18 @@ confirm() {
 menu() {
     print_banner
     cat <<EOF
-1. Install (prebuilt assets, lowest memory usage)
-2. Install (local build)
-3. Reinstall / upgrade (prebuilt assets)
-4. Reinstall / upgrade (local build)
-5. Status
-6. Health check
-7. Logs
-8. Uninstall
-0. Exit
+1. 安装（预构建产物，内存占用最低）
+2. 安装（本地构建）
+3. 重装 / 升级（预构建产物）
+4. 重装 / 升级（本地构建）
+5. 状态
+6. 健康检查
+7. 日志
+8. 卸载
+0. 退出
 EOF
     local choice
-    choice="$(prompt_text 'Choose an action' '1')"
+    choice="$(prompt_text '请选择操作' '1')"
     case "$choice" in
         1) COMMAND="install" ;;
         2) COMMAND="install-local" ;;
@@ -220,14 +220,14 @@ EOF
         7) COMMAND="logs" ;;
         8) COMMAND="uninstall" ;;
         0) exit 0 ;;
-        *) die "Invalid menu option: $choice" ;;
+        *) die "无效的菜单选项：$choice" ;;
     esac
 }
 
 load_config() {
     [[ -f "$CONFIG_FILE" ]] || return 0
     if grep -Eq '[`$()]' "$CONFIG_FILE"; then
-        die "Refusing to load unsafe config file: $CONFIG_FILE"
+        die "拒绝加载不安全的配置文件：$CONFIG_FILE"
     fi
     # shellcheck disable=SC1090
     . "$CONFIG_FILE"
@@ -286,16 +286,16 @@ check_os() {
         case "$ID" in
             ubuntu|debian) return 0 ;;
         esac
-        die "Unsupported distribution: ${ID:-unknown}. Use Debian 11+ or Ubuntu 20.04+"
+        die "不支持的发行版：${ID:-unknown}。请使用 Debian 11+ 或 Ubuntu 20.04+"
     fi
-    die "Cannot detect Linux distribution"
+    die "无法识别 Linux 发行版"
 }
 
 node_arch() {
     case "$(uname -m)" in
         x86_64) printf 'x64\n' ;;
         aarch64|arm64) printf 'arm64\n' ;;
-        *) die "Unsupported architecture: $(uname -m)" ;;
+        *) die "不支持的架构：$(uname -m)" ;;
     esac
 }
 
@@ -327,7 +327,7 @@ apt_install() {
 }
 
 ensure_packages() {
-    section "Installing system packages"
+    section "安装系统软件包"
 
     local nginx_present=0
     local nginx_active=0
@@ -351,22 +351,22 @@ ensure_packages() {
         fi
     fi
 
-    log "System packages are ready"
+    log "系统软件包已就绪"
 }
 
 ensure_build_packages() {
-    section "Installing local-build packages"
+    section "安装本地构建依赖"
     apt_install build-essential pkg-config
-    log "Local-build toolchain is ready"
+    log "本地构建工具链已就绪"
 }
 
 ensure_node() {
-    section "Installing private Node.js"
+    section "安装私有 Node.js"
     local arch url tmpfile
     arch="$(node_arch)"
     url="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${arch}.tar.xz"
     if [[ -x "$NODE_ROOT/bin/node" ]] && [[ "$($NODE_ROOT/bin/node --version 2>/dev/null || true)" == "v${NODE_VERSION}" ]]; then
-        log "Node.js v${NODE_VERSION} is already present"
+        log "Node.js v${NODE_VERSION} 已存在"
         return 0
     fi
     tmpfile="$(mktemp /tmp/npmbare-node.XXXXXX.tar.xz)"
@@ -376,18 +376,18 @@ ensure_node() {
     tar -xJf "$tmpfile" -C "$NODE_ROOT" --strip-components=1
     rm -f "$tmpfile"
     chown -R "$APP_USER:$APP_GROUP" "$NODE_ROOT"
-    log "Installed Node.js v${NODE_VERSION} into $NODE_ROOT"
+    log "已安装 Node.js v${NODE_VERSION} 到 $NODE_ROOT"
 }
 
 ensure_certbot() {
-    section "Installing private Certbot"
+    section "安装私有 Certbot"
     if [[ ! -x "$CERTBOT_VENV/bin/certbot" ]]; then
         rm -rf "$CERTBOT_VENV"
         python3 -m venv "$CERTBOT_VENV"
     fi
     chown -R "$APP_USER:$APP_GROUP" "$CERTBOT_VENV"
     run_as_app "'$CERTBOT_VENV/bin/python' -m pip install --upgrade pip certbot certbot-nginx >/dev/null"
-    log "Certbot environment is ready"
+    log "Certbot 环境已就绪"
 }
 
 copy_nginx_binary() {
@@ -414,16 +414,16 @@ ensure_proxy_ports_free() {
     local ports=(80 443 "$ADMIN_PORT")
     local seen=""
     if [[ "$ADMIN_PORT" == "80" || "$ADMIN_PORT" == "443" ]]; then
-        die "Admin port must not be 80 or 443"
+        die "管理后台端口不能是 80 或 443"
     fi
     for port in "${ports[@]}"; do
         [[ " $seen " == *" $port "* ]] && continue
         seen+=" $port"
         if port_in_use "$port"; then
             if [[ "$port" == "$ADMIN_PORT" ]]; then
-                die "Admin port $ADMIN_PORT is already in use"
+                die "管理后台端口 $ADMIN_PORT 已被占用"
             fi
-            die "Port $port is already in use. Bare-metal NPM must own ports 80 and 443"
+            die "端口 $port 已被占用。裸机版 NPM 必须独占 80 和 443"
         fi
     done
 }
@@ -456,26 +456,26 @@ collect_install_settings() {
     esac
 
     if [[ $NONINTERACTIVE -eq 0 ]] && ensure_tty; then
-        section "Deployment settings"
-        ADMIN_PORT="$(prompt_text 'Admin panel port' "$ADMIN_PORT")"
-        INSTALL_REF="$(prompt_text 'Git ref to deploy' "$INSTALL_REF")"
+        section "部署设置"
+        ADMIN_PORT="$(prompt_text '管理后台端口' "$ADMIN_PORT")"
+        INSTALL_REF="$(prompt_text '要部署的 Git 引用' "$INSTALL_REF")"
         if [[ "$COMMAND" == "install" || "$COMMAND" == "reinstall" || "$COMMAND" == "upgrade" ]]; then
             local mode_choice
-            mode_choice="$(prompt_text 'Install mode (prebuilt/local)' "$INSTALL_MODE")"
+            mode_choice="$(prompt_text '安装模式（prebuilt/local）' "$INSTALL_MODE")"
             case "$mode_choice" in
                 prebuilt|local) INSTALL_MODE="$mode_choice" ;;
-                *) die "Install mode must be prebuilt or local" ;;
+                *) die "安装模式必须是 prebuilt 或 local" ;;
             esac
         fi
     fi
 
-    validate_port "$ADMIN_PORT" || die "Invalid admin port: $ADMIN_PORT"
-    [[ -n "$INSTALL_REF" ]] || die "Git ref cannot be empty"
-    [[ -n "$NODE_VERSION" ]] || die "Node version cannot be empty"
+    validate_port "$ADMIN_PORT" || die "无效的管理后台端口：$ADMIN_PORT"
+    [[ -n "$INSTALL_REF" ]] || die "Git 引用不能为空"
+    [[ -n "$NODE_VERSION" ]] || die "Node 版本不能为空"
 }
 
 clone_source() {
-    section "Fetching source code"
+    section "拉取源码"
     rm -rf "$SRC_DIR"
     if ! git clone --depth 1 --branch "$INSTALL_REF" "$GIT_REPO" "$SRC_DIR" >/dev/null 2>&1; then
         git clone --depth 1 "$GIT_REPO" "$SRC_DIR" >/dev/null 2>&1
@@ -491,7 +491,7 @@ clone_source() {
         git remote add upstream "$UPSTREAM_REPO" >/dev/null 2>&1 || true
     )
     chown -R "$APP_USER:$APP_GROUP" "$SRC_DIR"
-    log "Checked out $INSTALL_REF"
+    log "已检出 $INSTALL_REF"
 }
 
 release_json_for_ref() {
@@ -504,7 +504,7 @@ use_prebuilt_assets() {
 
     local json frontend_url backend_url tmpdir
     if ! json="$(release_json_for_ref "$INSTALL_REF" 2>/dev/null)"; then
-        warn "No prebuilt release was found for ref $INSTALL_REF"
+        warn "未找到引用 $INSTALL_REF 对应的预构建 release"
         return 1
     fi
 
@@ -512,11 +512,11 @@ use_prebuilt_assets() {
     backend_url="$(printf '%s' "$json" | jq -r '.assets[] | select(.name == "backend-modules.tar.gz") | .browser_download_url' | head -1)"
 
     if [[ -z "$frontend_url" || "$frontend_url" == "null" || -z "$backend_url" || "$backend_url" == "null" ]]; then
-        warn "Prebuilt assets are incomplete for ref $INSTALL_REF"
+        warn "引用 $INSTALL_REF 的预构建产物不完整"
         return 1
     fi
 
-    section "Downloading prebuilt assets"
+    section "下载预构建产物"
     tmpdir="$(mktemp -d /tmp/npmbare-assets.XXXXXX)"
     curl -fsSL "$frontend_url" -o "$tmpdir/frontend-dist.tar.gz"
     curl -fsSL "$backend_url" -o "$tmpdir/backend-modules.tar.gz"
@@ -527,17 +527,17 @@ use_prebuilt_assets() {
     rm -rf "$tmpdir"
 
     chown -R "$APP_USER:$APP_GROUP" "$SRC_DIR/frontend/dist" "$SRC_DIR/backend/node_modules"
-    log "Applied prebuilt frontend and backend dependencies"
+    log "已应用预构建前端和后端依赖"
     return 0
 }
 
 local_build() {
-    section "Running local build"
+    section "执行本地构建"
     ensure_build_packages
     run_as_app "export COREPACK_ENABLE_DOWNLOAD_PROMPT=0; export PATH='$NODE_ROOT/bin:$PATH'; cd '$SRC_DIR/backend'; corepack yarn install --frozen-lockfile"
     run_as_app "export COREPACK_ENABLE_DOWNLOAD_PROMPT=0; export PATH='$NODE_ROOT/bin:$PATH'; cd '$SRC_DIR/frontend'; corepack yarn install --frozen-lockfile"
     run_as_app "export COREPACK_ENABLE_DOWNLOAD_PROMPT=0; export PATH='$NODE_ROOT/bin:$PATH'; cd '$SRC_DIR/frontend'; corepack yarn build"
-    log "Local build completed"
+    log "本地构建完成"
 }
 
 prepare_artifacts() {
@@ -557,7 +557,7 @@ write_fallback_page() {
 
     cat > "$RUNTIME_WWW_DIR/index.html" <<'EOF'
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <title>Nginx Proxy Manager</title>
@@ -571,7 +571,7 @@ write_fallback_page() {
 <body>
   <main>
     <h1>Nginx Proxy Manager</h1>
-    <p>The proxy is running, but no host is configured for this domain yet.</p>
+    <p>代理服务已运行，但此域名尚未配置站点。</p>
   </main>
 </body>
 </html>
@@ -596,7 +596,7 @@ write_resolvers_conf() {
 }
 
 write_runtime_files() {
-    section "Preparing isolated runtime"
+    section "准备隔离运行环境"
 
     mkdir -p "$RUNTIME_DATA_DIR/nginx"/{access,custom_ssl,default_host,default_www,dead_host,proxy_host,redirection_host,stream,temp,custom}
     mkdir -p "$RUNTIME_DATA_DIR"/{logs,access,custom_ssl,letsencrypt-acme-challenge}
@@ -819,15 +819,15 @@ server {
 EOF
 
     chown -R "$APP_USER:$APP_GROUP" "$APP_ROOT" "$STATE_ROOT" "$LOG_ROOT" "$SHIM_DIR"
-    log "Isolated runtime tree is ready"
+    log "隔离运行环境已就绪"
 }
 write_service_units() {
-    section "Writing systemd units"
+    section "写入 systemd 服务单元"
     write_runtime_env
 
     cat > "/etc/systemd/system/$SERVICE_NGINX" <<EOF
 [Unit]
-Description=Nginx Proxy Manager private nginx
+Description=Nginx Proxy Manager 私有 nginx
 After=network.target
 
 [Service]
@@ -858,7 +858,7 @@ EOF
 
     cat > "/etc/systemd/system/$SERVICE_BACKEND" <<EOF
 [Unit]
-Description=Nginx Proxy Manager backend
+Description=Nginx Proxy Manager 后端服务
 After=network-online.target $SERVICE_NGINX
 Wants=network-online.target $SERVICE_NGINX
 
@@ -897,7 +897,7 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    log "Systemd units written"
+    log "systemd 服务单元已写入"
 }
 
 stop_services() {
@@ -915,18 +915,18 @@ wait_for_health() {
         tries=$((tries - 1))
         sleep 2
     done
-    warn "Admin API did not become ready in time"
+    warn "管理后台 API 未能在预期时间内就绪"
     journalctl -u "$SERVICE_BACKEND" -n 20 --no-pager || true
     return 1
 }
 
 start_services() {
-    section "Starting services"
+    section "启动服务"
     systemctl enable "$SERVICE_NGINX" "$SERVICE_BACKEND" >/dev/null 2>&1 || true
     systemctl start "$SERVICE_NGINX"
     systemctl start "$SERVICE_BACKEND"
     wait_for_health
-    log "Services are running"
+    log "服务已启动"
 }
 
 status_report() {
@@ -938,16 +938,16 @@ status_report() {
         ip_addr="${ip_addr:-127.0.0.1}"
     fi
 
-    section "Deployment status"
-    printf 'Backend service : %s\n' "$(systemctl is-active "$SERVICE_BACKEND" 2>/dev/null || echo inactive)"
-    printf 'Nginx service   : %s\n' "$(systemctl is-active "$SERVICE_NGINX" 2>/dev/null || echo inactive)"
-    printf 'Admin port      : %s\n' "$admin_port"
-    printf 'Deploy ref      : %s\n' "${INSTALL_REF:-not-configured}"
-    printf 'Install mode    : %s\n' "${INSTALL_MODE:-not-configured}"
-    printf 'Node runtime    : %s\n' "$($NODE_ROOT/bin/node --version 2>/dev/null || echo missing)"
-    printf 'Admin URL       : http://%s:%s\n' "$ip_addr" "$admin_port"
-    printf 'Source path     : %s\n' "$SRC_DIR"
-    printf 'State path      : %s\n' "$STATE_ROOT"
+    section "部署状态"
+    printf '后端服务     : %s\n' "$(systemctl is-active "$SERVICE_BACKEND" 2>/dev/null || echo inactive)"
+    printf 'Nginx 服务    : %s\n' "$(systemctl is-active "$SERVICE_NGINX" 2>/dev/null || echo inactive)"
+    printf '管理后台端口 : %s\n' "$admin_port"
+    printf '部署引用     : %s\n' "${INSTALL_REF:-未配置}"
+    printf '安装模式     : %s\n' "${INSTALL_MODE:-未配置}"
+    printf 'Node 运行时  : %s\n' "$($NODE_ROOT/bin/node --version 2>/dev/null || echo 缺失)"
+    printf '管理后台地址 : http://%s:%s\n' "$ip_addr" "$admin_port"
+    printf '源码路径     : %s\n' "$SRC_DIR"
+    printf '状态路径     : %s\n' "$STATE_ROOT"
 }
 
 health_report() {
@@ -955,48 +955,48 @@ health_report() {
     local failures=0
     local admin_port="${ADMIN_PORT:-$DEFAULT_ADMIN_PORT}"
 
-    section "Health check"
+    section "健康检查"
 
     if systemctl is-active "$SERVICE_BACKEND" >/dev/null 2>&1; then
-        log "Backend service is active"
+        log "后端服务处于活动状态"
     else
-        error "Backend service is not active"
+        error "后端服务未处于活动状态"
         failures=$((failures + 1))
     fi
 
     if systemctl is-active "$SERVICE_NGINX" >/dev/null 2>&1; then
-        log "Private nginx service is active"
+        log "私有 nginx 服务处于活动状态"
     else
-        error "Private nginx service is not active"
+        error "私有 nginx 服务未处于活动状态"
         failures=$((failures + 1))
     fi
 
     if run_in_root_namespace "'$NGINX_REAL_BIN' -c /etc/nginx/nginx.conf -p /run/npm-bare/ -t" >/dev/null 2>&1; then
-        log "Private nginx configuration passes syntax test"
+        log "私有 nginx 配置通过语法检查"
     else
-        error "Private nginx configuration failed syntax test"
+        error "私有 nginx 配置未通过语法检查"
         failures=$((failures + 1))
     fi
 
     if curl -fsS "http://127.0.0.1:${admin_port}/api/" >/dev/null 2>&1; then
-        log "Admin API responds on port ${admin_port}"
+        log "管理后台 API 在端口 ${admin_port} 上可访问"
     else
-        error "Admin API is not responding on port ${admin_port}"
+        error "管理后台 API 在端口 ${admin_port} 上无响应"
         failures=$((failures + 1))
     fi
 
     if [[ -f "$RUNTIME_DATA_DIR/database.sqlite" ]]; then
-        log "SQLite database exists"
+        log "SQLite 数据库已存在"
     else
-        warn "SQLite database has not been created yet"
+        warn "SQLite 数据库尚未创建"
     fi
 
     if (( failures > 0 )); then
-        error "Health check failed with ${failures} problem(s)"
+        error "健康检查失败，共发现 ${failures} 个问题"
         return 1
     fi
 
-    log "Health check passed"
+    log "健康检查通过"
 }
 
 logs_report() {
@@ -1010,13 +1010,13 @@ write_install_summary() {
     ip_addr="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
     ip_addr="${ip_addr:-127.0.0.1}"
 
-    section "Deployment complete"
-    printf 'Admin URL : http://%s:%s\n' "$ip_addr" "$admin_port"
-    printf 'API check : http://127.0.0.1:%s/api/\n' "$admin_port"
-    printf 'Source    : %s\n' "$SRC_DIR"
-    printf 'Data      : %s\n' "$STATE_ROOT"
-    printf 'Logs      : journalctl -u %s -u %s -f\n' "$SERVICE_BACKEND" "$SERVICE_NGINX"
-    printf 'Notes     : First login follows the upstream setup wizard unless you passed initial admin env vars.\n'
+    section "部署完成"
+    printf '管理后台地址 : http://%s:%s\n' "$ip_addr" "$admin_port"
+    printf 'API 检查     : http://127.0.0.1:%s/api/\n' "$admin_port"
+    printf '源码路径     : %s\n' "$SRC_DIR"
+    printf '数据路径     : %s\n' "$STATE_ROOT"
+    printf '日志命令     : journalctl -u %s -u %s -f\n' "$SERVICE_BACKEND" "$SERVICE_NGINX"
+    printf '说明         : 如果没有传入初始管理员环境变量，首次登录会进入上游自带的初始化向导。\n'
 }
 
 remove_services() {
@@ -1027,9 +1027,9 @@ remove_services() {
 }
 
 uninstall_all() {
-    section "Uninstalling"
+    section "正在卸载"
     if [[ $KEEP_DATA -eq 0 ]] && [[ $FORCE -eq 0 ]] && [[ $NONINTERACTIVE -eq 0 ]]; then
-        confirm "Remove all NPM Bare Metal data, certificates and logs?" "y" || KEEP_DATA=1
+        confirm "是否移除全部 NPM 裸机部署数据、证书和日志？" "y" || KEEP_DATA=1
     fi
 
     remove_services
@@ -1046,9 +1046,9 @@ uninstall_all() {
         groupdel "$APP_GROUP" >/dev/null 2>&1 || true
     fi
 
-    log "Uninstall finished"
+    log "卸载完成"
     if [[ $KEEP_DATA -eq 1 ]]; then
-        info "Data was preserved under $STATE_ROOT"
+        info "数据已保留在 $STATE_ROOT"
     fi
 }
 
@@ -1085,7 +1085,7 @@ perform_upgrade() {
     require_root
     require_linux
     check_os
-    [[ -f "$CONFIG_FILE" ]] || die "No existing installation was found"
+    [[ -f "$CONFIG_FILE" ]] || die "未找到现有安装"
     collect_install_settings
     ensure_directories
     ensure_user
@@ -1149,7 +1149,7 @@ main() {
             usage
             ;;
         *)
-            die "Unknown command: $COMMAND"
+            die "未知命令：$COMMAND"
             ;;
     esac
 }
