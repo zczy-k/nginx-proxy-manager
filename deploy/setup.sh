@@ -569,30 +569,18 @@ server {
 }
 NGINX_CONF
 
-    # 复制 Docker fallback server (定义 $server/$forward_scheme/$port 变量)
-    # log_format 和 proxy.conf 引用这些变量，没有 fallback 会导致 unknown variable 错误
-    # 仅保留 port 80 块 (提供变量定义)，port 443 块需要 ssl_reject_handshake (nginx 1.19.4+)
-    # 或 ssl_certificate，与用户已有的 443 server 冲突，故移除
-    local docker_default="$NPM_DIR/docker/rootfs/etc/nginx/conf.d/default.conf"
-    if [[ -f "$docker_default" ]]; then
-        # 只提取第一个 server 块 (port 80)，丢弃 443 块
-        awk '
-        /^\s*server\s*\{/ { depth=0; buf=""; capturing=1 }
-        capturing {
-            buf = buf $0 "\n"
-            depth += gsub(/{/, "{")
-            depth -= gsub(/}/, "}")
-            if (depth <= 0) { print buf; capturing=0 }
-        }
-        ' "$docker_default" > "$NGINX_CONF_DIR/npm-default.conf"
-        # 移除不兼容指令 (nginx < 1.19.4)
-        sed -i '/ssl_reject_handshake/d' "$NGINX_CONF_DIR/npm-default.conf"
-    fi
+    # 清理旧版 npm-default.conf (已弃用，变量默认值改由 http_top.conf 的 set 指令提供)
+    rm -f "$NGINX_CONF_DIR/npm-default.conf"
 
-    # NPM http 级配置 (map / cache / log_format)
+    # NPM http 级配置 (变量默认值 + log_format + cache + map)
+    # 隔离设计: 仅包含声明式指令，不含 server 块，不影响用户已有配置
     cat > "$NGINX_DATA_DIR/custom/http_top.conf" << 'HTTP_TOP'
 # --- NPM Bare-Metal: http-level configuration ---
-# Log formats (referenced by backend-generated configs)
+# Variable defaults (backend-generated proxy hosts override these per-server)
+set $server "127.0.0.1";
+set $port "80";
+
+# Log formats (used by backend-generated proxy host configs)
 log_format proxy '[$time_local] $upstream_cache_status $upstream_status $status - $request_method $scheme $host "$request_uri" [Client $remote_addr] [Length $body_bytes_sent] [Gzip $gzip_ratio] [Sent-to $server] "$http_user_agent" "$http_referer"';
 log_format standard '[$time_local] $status - $request_method $scheme $host "$request_uri" [Client $remote_addr] [Length $body_bytes_sent] [Gzip $gzip_ratio] "$http_user_agent" "$http_referer"';
 
