@@ -35,7 +35,6 @@ NPM_USER="npm"; NPM_GROUP="npm"
 DATA_DIR="/data/npm"; LOG_DIR="/var/log/npm"
 NGINX_DATA_DIR="/data/nginx"
 NGINX_CONF_DIR="/etc/nginx/npm-conf.d"
-BACKUP_DIR="/var/backups/npm-$(date +%s)"
 NODE_VERSION="22"
 SCRIPT_VERSION="3.0.0"
 ENV_FILE="$NPM_DIR/.env"
@@ -231,17 +230,7 @@ has_port_conflicts() {
 resolve_port_conflicts() {
     # 隔离原则: 绝不停止或禁用其他服务，仅提示用户修改 NPM 端口
     section "端口冲突"
-    local ports=($PORT_HTTP $PORT_HTTPS $PORT_ADMIN)
-    local seen=()
-    for port in "${ports[@]}"; do
-        [[ " ${seen[*]} " =~ " $port " ]] && continue; seen+=("$port")
-        local pid
-        pid=$(ss -tlnp "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1) || true
-        if [[ -n "$pid" ]]; then
-            local proc; proc=$(ps -p "$pid" -o comm= 2>/dev/null || echo "未知")
-            warn "端口 $port 被 $proc (PID:$pid) 占用"
-        fi
-    done
+    detect_port_conflicts || true  # 复用检测函数输出冲突详情
     echo ""
     warn "NPM 不会停止其他服务。请修改 NPM 端口以避免冲突。"
     info "建议: HTTP→8080, HTTPS→8443, 管理→8181"
@@ -488,11 +477,10 @@ build_frontend() {
 download_prebuilt() {
     section "下载预构建产物"
     local release_tag="build-latest"
-    local api_url="https://api.github.com/repos/${GIT_REPO#*://*/}/releases/tags/${release_tag}"
     # 兼容 https://github.com/user/repo.git 和 https://github.com/user/repo 两种格式
     local repo_path
     repo_path=$(echo "$GIT_REPO" | sed -E 's|https?://github\.com/||; s|\.git$||')
-    api_url="https://api.github.com/repos/${repo_path}/releases/tags/${release_tag}"
+    local api_url="https://api.github.com/repos/${repo_path}/releases/tags/${release_tag}"
 
     info "检查 GitHub Release (${release_tag}) ..."
 
@@ -522,10 +510,10 @@ download_prebuilt() {
         # 检查 Node.js 版本是否匹配
         local local_node
         local_node=$(node --version 2>/dev/null || echo "none")
-        local build_major local_major
+        local build_major local_node_major
         build_major=$(echo "$build_node" | grep -oP 'v\K[0-9]+' || echo "0")
-        local_major=$(echo "$local_node" | grep -oP 'v\K[0-9]+' || echo "0")
-        if [[ "$build_major" != "$local_major" ]]; then
+        local_node_major=$(echo "$local_node" | grep -oP 'v\K[0-9]+' || echo "0")
+        if [[ "$build_major" != "$local_node_major" ]]; then
             warn "Node.js 版本不匹配 (本地: ${local_node}, 构建: ${build_node})"
             warn "原生模块可能不兼容，回退到本地构建"
             return 1
@@ -1085,7 +1073,7 @@ run_install() {
     fi
 
     create_data_dirs
-    configure_nginx
+    configure_nginx || { error "Nginx 配置失败，安装中止"; exit 1; }
     install_nginx_wrapper
     save_env
     create_systemd_service
