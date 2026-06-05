@@ -576,9 +576,10 @@ NGINX_CONF
     # 隔离设计: 仅包含声明式指令，不含 server 块，不影响用户已有配置
     cat > "$NGINX_DATA_DIR/custom/http_top.conf" << 'HTTP_TOP'
 # --- NPM Bare-Metal: http-level configuration ---
-# Variable defaults (backend-generated proxy hosts override these per-server)
-set $server "127.0.0.1";
-set $port "80";
+# Variable defaults via map (set is not allowed at http level in nginx)
+# Backend-generated proxy hosts override these with server-level set directives
+map "" $server { default "127.0.0.1"; }
+map "" $port { default "80"; }
 
 # Log formats (used by backend-generated proxy host configs)
 log_format proxy '[$time_local] $upstream_cache_status $upstream_status $status - $request_method $scheme $host "$request_uri" [Client $remote_addr] [Length $body_bytes_sent] [Gzip $gzip_ratio] [Sent-to $server] "$http_user_agent" "$http_referer"';
