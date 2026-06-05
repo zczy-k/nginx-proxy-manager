@@ -574,6 +574,9 @@ NGINX_CONF
     local docker_default="$NPM_DIR/docker/rootfs/etc/nginx/conf.d/default.conf"
     if [[ -f "$docker_default" ]]; then
         cp "$docker_default" "$NGINX_CONF_DIR/npm-default.conf"
+        # ssl_reject_handshake 需要 nginx 1.19.4+，Ubuntu 22.04 自带 1.18 不支持
+        # return 444 已在同一 server 块中，效果等价
+        sed -i '/ssl_reject_handshake/d' "$NGINX_CONF_DIR/npm-default.conf"
     fi
 
     # NPM http 级配置 (map / cache / log_format)
