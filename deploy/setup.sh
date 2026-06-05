@@ -529,7 +529,8 @@ configure_nginx() {
 
     mkdir -p "$NGINX_CONF_DIR"
     # 管理面板配置 (后端固定 3000 端口)
-    # 注意: 后端路由无 /api/ 前缀，直接挂载在 / (tokens, users, nginx/*, socket.io 等)
+    # 前端 base.ts 给所有 API 调用加 /api/ 前缀，nginx 用 trailing slash 去掉前缀
+    # 例: GET /api/tokens → proxy_pass → GET /tokens (后端路由无 /api/ 前缀)
     cat > "$NGINX_CONF_DIR/npm-admin.conf" << NGINX_CONF
 server {
     listen ${PORT_ADMIN};
@@ -541,7 +542,17 @@ server {
     root ${NPM_DIR}/frontend/dist;
     index index.html;
 
-    # WebSocket (socket.io)
+    # API: 前端 /api/* → 后端 /* (trailing slash 去除 /api/ 前缀)
+    location /api/ {
+        proxy_pass http://127.0.0.1:3000/;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    # WebSocket (socket.io 不走 /api/ 前缀)
     location /socket.io/ {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
@@ -549,55 +560,6 @@ server {
         proxy_set_header Connection 'upgrade';
         proxy_set_header Host \$host;
         proxy_cache_bypass \$http_upgrade;
-    }
-
-    # Backend API routes (no /api/ prefix — Express mounts at /)
-    location /tokens {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-    location /users {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-    location /nginx {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-    location /schema {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-    }
-    location /settings {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    }
-    location /audit-log {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-    }
-    location /reports {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
     }
 
     # SPA fallback (前端路由)
