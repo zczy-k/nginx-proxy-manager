@@ -285,7 +285,8 @@ cleanup_old_install() {
     sed -i '/npm-conf\.d/d' /etc/nginx/nginx.conf 2>/dev/null || true
     sed -i '/http_top\.conf/d' /etc/nginx/nginx.conf 2>/dev/null || true
     sed -i '/data\/nginx\/stream/d' /etc/nginx/nginx.conf 2>/dev/null || true
-    sed -i '/log-stream\.conf/d' /etc/nginx/nginx.conf 2>/dev/null || true
+    sed -i '/npm-stream-fwd/d' /etc/nginx/nginx.conf 2>/dev/null || true
+    rm -f /etc/nginx/npm-stream-fwd.conf 2>/dev/null || true
     # 清理旧 wrapper
     dpkg-divert --list 2>/dev/null | grep -q "/usr/sbin/nginx" && {
         rm -f /usr/sbin/nginx; dpkg-divert --remove --rename /usr/sbin/nginx 2>/dev/null || true
@@ -559,9 +560,12 @@ LE_INI
 
 configure_nginx() {
     section "配置 Nginx"
-    # 备份
-    mkdir -p "$BACKUP_DIR"
-    [[ -d /etc/nginx ]] && cp -r /etc/nginx "$BACKUP_DIR/nginx-backup"
+    # 精确回滚准备：仅备份 nginx.conf (全量备份恢复会丢失 NPM 注入的 include)
+    local nginx_conf_bak=""
+    if [[ -f /etc/nginx/nginx.conf ]]; then
+        nginx_conf_bak="/etc/nginx/nginx.conf.npm-bak.$$"
+        cp /etc/nginx/nginx.conf "$nginx_conf_bak"
+    fi
 
     mkdir -p "$NGINX_CONF_DIR"
     # 管理面板配置 (后端固定 3000 端口)
@@ -785,8 +789,8 @@ STREAM_FWD
         # 在 nginx.conf 顶层注入 stream include (如果尚未存在)
         local nc2="/etc/nginx/nginx.conf"
         if [[ -f "$nc2" ]] && ! grep -q 'npm-stream-fwd' "$nc2" 2>/dev/null; then
-            # 在文件第一行之后插入 (避免放在 shebang 之前)
-            sed -i '1 a\include /etc/nginx/npm-stream-fwd.conf;' "$nc2"
+            # 追加到文件末尾 (stream {} 块必须出现在顶层，不能在 http/events 块内)
+            echo 'include /etc/nginx/npm-stream-fwd.conf;' >> "$nc2"
             log "已注入 stream 端口转发 ($PORT_HTTP→80, $PORT_HTTPS→443)"
         fi
     else
@@ -794,16 +798,25 @@ STREAM_FWD
         sed -i '/npm-stream-fwd/d' /etc/nginx/nginx.conf 2>/dev/null || true
     fi
 
-    # nginx 配置测试 (显示完整错误信息便于排查)
+    # nginx 配置测试 (精确回滚: 失败时仅恢复 nginx.conf + 清理 NPM 文件)
     local nginx_test_output
     if nginx_test_output=$(nginx -t 2>&1); then
+        [[ -n "$nginx_conf_bak" && -f "$nginx_conf_bak" ]] && rm -f "$nginx_conf_bak"
         systemctl reload nginx
         log "Nginx 配置生效"
     else
-        warn "配置测试失败，恢复备份..."
+        warn "Nginx 配置测试失败，回滚本次变更..."
         echo "$nginx_test_output" | while IFS= read -r line; do warn "  $line"; done
-        [[ -d "$BACKUP_DIR/nginx-backup" ]] && cp -r "$BACKUP_DIR/nginx-backup"/* /etc/nginx/
+        # 精确回滚：恢复 nginx.conf 原始内容
+        if [[ -n "$nginx_conf_bak" && -f "$nginx_conf_bak" ]]; then
+            mv "$nginx_conf_bak" /etc/nginx/nginx.conf
+        fi
+        # 清理本次创建的 NPM 专属文件 (不影响用户已有 nginx 配置)
+        rm -rf "$NGINX_CONF_DIR"
+        rm -f /etc/nginx/npm-stream-fwd.conf
         systemctl reload nginx 2>/dev/null || true
+        error "Nginx 配置失败，变更已精确回滚。请根据上方错误修正后重试。"
+        return 1
     fi
 }
 
@@ -1014,7 +1027,8 @@ _uninstall_common() {
     sed -i '/npm-conf\.d/d' /etc/nginx/nginx.conf 2>/dev/null || true
     sed -i '/http_top\.conf/d' /etc/nginx/nginx.conf 2>/dev/null || true
     sed -i '/data\/nginx\/stream/d' /etc/nginx/nginx.conf 2>/dev/null || true
-    sed -i '/log-stream\.conf/d' /etc/nginx/nginx.conf 2>/dev/null || true
+    sed -i '/npm-stream-fwd/d' /etc/nginx/nginx.conf 2>/dev/null || true
+    rm -f /etc/nginx/npm-stream-fwd.conf 2>/dev/null || true
     [[ -d /etc/nginx/conf.d/include ]] && rm -rf /etc/nginx/conf.d/include
     systemctl reload nginx 2>/dev/null || true
     dpkg-divert --list 2>/dev/null | grep -q "/usr/sbin/nginx" && {
