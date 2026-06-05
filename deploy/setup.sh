@@ -648,8 +648,24 @@ EOF
     mkdir -p /var/lib/nginx/cache/public /var/lib/nginx/cache/private
     chown -R www-data:www-data /var/lib/nginx/cache 2>/dev/null || true
 
-    # 注入 include (兼容不同 nginx.conf 格式)
+    # 注入前: 检测与用户已有配置的潜在冲突
     local nc="/etc/nginx/nginx.conf"
+    if [[ -f "$nc" ]]; then
+        # 检测 map 变量名冲突 (NPM 定义了 map $host $forward_scheme 等)
+        local conflict_maps=()
+        for var in forward_scheme x_forwarded_proto x_forwarded_scheme; do
+            if grep -qE "map\s+\S+\s+\\\$${var}\b" "$nc" 2>/dev/null; then
+                conflict_maps+=("\$$var")
+            fi
+        done
+        if [[ ${#conflict_maps[@]} -gt 0 ]]; then
+            warn "检测到 map 变量名冲突: ${conflict_maps[*]}"
+            warn "NPM 需要在 http 块中定义这些 map，如果您的配置也定义了同名 map，"
+            warn "请移除您配置中的定义，NPM 的 map 会自动处理。"
+        fi
+    fi
+
+    # 注入 include (隔离设计: 仅在 http {} 末尾追加 2 行 include)
     if [[ -f "$nc" ]]; then
         # http 块注入: 在 http {} 末尾 (最后一个 } 之前) 追加 include
         if ! grep -q "npm-conf.d" "$nc" 2>/dev/null; then
