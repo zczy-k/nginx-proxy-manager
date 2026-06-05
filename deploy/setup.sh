@@ -3,8 +3,8 @@
 # Nginx Proxy Manager - Bare-Metal 部署工具
 # 适用: Ubuntu 20.04+ / Debian 11+ | 2C1G 低配服务器
 # 原则: 不修改上游源码 | 运行时配置 + 系统级包装实现适配
-# 用法: sudo bash deploy/setup.sh
-#   或: curl -fsSL .../deploy/setup.sh | sudo bash
+# 用法: curl -fsSL https://raw.githubusercontent.com/zczy-k/nginx-proxy-manager/develop/deploy/setup.sh | sudo bash -s -- install
+#   或: curl -fsSL ... | sudo bash                        (交互式菜单)
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -1022,13 +1022,13 @@ case "${1:-}" in
     status|-s)   show_status ;;
     --help|-h)
         echo -e "${CYAN}NPM Bare-Metal 部署工具 v${SCRIPT_VERSION}${NC}"
-        echo "  bash deploy/setup.sh              交互菜单"
-        echo "  bash deploy/setup.sh install      安装 (优先下载预构建)"
-        echo "  bash deploy/setup.sh install-local 安装 (强制本地编译)"
-        echo "  bash deploy/setup.sh uninstall    卸载"
-        echo "  bash deploy/setup.sh upgrade      升级"
-        echo "  bash deploy/setup.sh health       健康检查"
-        echo "  bash deploy/setup.sh status       状态"
+        echo "  curl -fsSL .../setup.sh | sudo bash -s -- install       安装 (优先下载预构建)"
+        echo "  curl -fsSL .../setup.sh | sudo bash -s -- install-local 安装 (强制本地编译)"
+        echo "  curl -fsSL .../setup.sh | sudo bash                     交互菜单"
+        echo "  curl -fsSL .../setup.sh | sudo bash -s -- uninstall     卸载"
+        echo "  curl -fsSL .../setup.sh | sudo bash -s -- upgrade       升级"
+        echo "  curl -fsSL .../setup.sh | sudo bash -s -- health        健康检查"
+        echo "  curl -fsSL .../setup.sh | sudo bash -s -- status        状态"
         ;;
     *) main_menu ;;
 esac

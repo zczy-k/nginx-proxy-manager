@@ -5,32 +5,25 @@
 ## 快速开始
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zczy-k/nginx-proxy-manager/develop/deploy/setup.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/zczy-k/nginx-proxy-manager/develop/deploy/setup.sh | sudo bash -s -- install
 ```
 
-或先克隆再运行：
+## 其他命令
 
-```bash
-git clone --depth 1 https://github.com/zczy-k/nginx-proxy-manager.git /opt/nginx-proxy-manager
-sudo bash /opt/nginx-proxy-manager/deploy/setup.sh
-```
+| 命令 | 说明 |
+|------|------|
+| `curl -fsSL .../setup.sh \| sudo bash` | 交互式菜单 |
+| `curl -fsSL .../setup.sh \| sudo bash -s -- install-local` | 安装 (强制本地编译) |
+| `curl -fsSL .../setup.sh \| sudo bash -s -- uninstall` | 卸载 |
+| `curl -fsSL .../setup.sh \| sudo bash -s -- upgrade` | 升级 |
+| `curl -fsSL .../setup.sh \| sudo bash -s -- health` | 健康检查 |
+| `curl -fsSL .../setup.sh \| sudo bash -s -- status` | 查看状态 |
 
 ## 设计原则
 
 - **不修改上游源码** — 通过 Nginx Wrapper (dpkg-divert) + 运行时配置实现适配
 - **可安全 merge 上游更新** — fork 中的 deploy/ 目录独立于上游代码
 - **资源节约** — 2C1G 服务器 ~150MB，为 Docker 版的 1/3
-
-## 功能
-
-| 命令 | 说明 |
-|------|------|
-| `bash deploy/setup.sh` | 交互式菜单 |
-| `bash deploy/setup.sh install` | 安装 |
-| `bash deploy/setup.sh uninstall` | 卸载 (保留数据/完全清除) |
-| `bash deploy/setup.sh upgrade` | 升级 (从 origin 或 upstream) |
-| `bash deploy/setup.sh health` | 健康检查 (7 项检测) |
-| `bash deploy/setup.sh status` | 查看状态 |
 
 ## 技术细节
 
