@@ -42,8 +42,8 @@ ENV_FILE="$NPM_DIR/.env"
 UPSTREAM_REPO="https://github.com/NginxProxyManager/nginx-proxy-manager.git"
 GIT_REPO="https://github.com/zczy-k/nginx-proxy-manager.git"
 
-# 端口默认值 (后端固定 3000，HTTP/HTTPS 由后端模板硬编码 80/443)
-PORT_ADMIN=81
+# 端口默认值 (后端固定 3000; HTTP/HTTPS 由模板硬编码 80/443, 自定义端口通过 stream 转发)
+PORT_HTTP=80; PORT_HTTPS=443; PORT_ADMIN=81
 
 # ═══════════════════════════════════════════════════════════════
 # 工具函数
@@ -111,6 +111,8 @@ save_env() {
     mkdir -p "$(dirname "$ENV_FILE")"
     cat > "$ENV_FILE" << ENVEOF
 # NPM Bare-Metal 配置 (由 setup.sh 自动管理)
+PORT_HTTP=$PORT_HTTP
+PORT_HTTPS=$PORT_HTTPS
 PORT_ADMIN=$PORT_ADMIN
 ENVEOF
     chmod 600 "$ENV_FILE"
@@ -121,7 +123,7 @@ load_env() {
     [[ -f "$ENV_FILE" ]] || return 0
     if grep -qE '^\s*[^#]\s*=' "$ENV_FILE" && ! grep -qE '[;&|`$()]' "$ENV_FILE"; then
         . "$ENV_FILE"
-        info "已加载配置: 管理=$PORT_ADMIN"
+        info "已加载配置: HTTP=$PORT_HTTP HTTPS=$PORT_HTTPS 管理=$PORT_ADMIN"
     else
         warn "$ENV_FILE 内容异常，跳过加载"
     fi
@@ -160,15 +162,21 @@ detect_existing_npm() {
 }
 
 detect_port_conflicts() {
-    local pid
-    pid=$(ss -tlnp "sport = :$PORT_ADMIN" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1) || true
-    if [[ -n "$pid" ]]; then
-        local proc; proc=$(ps -p "$pid" -o comm= 2>/dev/null || echo "未知")
-        warn "管理端口 $PORT_ADMIN 已被占用 (PID: $pid, $proc)"; return 0
-    else
-        info "管理端口 $PORT_ADMIN: 空闲"
-    fi
-    return 1
+    local ports=($PORT_HTTP $PORT_HTTPS $PORT_ADMIN)
+    local has_conflict=false
+    local seen=()
+    for port in "${ports[@]}"; do
+        [[ " ${seen[*]} " =~ " $port " ]] && continue; seen+=("$port")
+        local pid
+        pid=$(ss -tlnp "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1) || true
+        if [[ -n "$pid" ]]; then
+            local proc; proc=$(ps -p "$pid" -o comm= 2>/dev/null || echo "未知")
+            warn "端口 $port 已被占用 (PID: $pid, $proc)"; has_conflict=true
+        else
+            info "端口 $port: 空闲"
+        fi
+    done
+    $has_conflict
 }
 
 detect_nginx_conflicts() {
@@ -204,39 +212,55 @@ detect_certbot() {
 # 冲突解决
 # ═══════════════════════════════════════════════════════════════
 has_port_conflicts() {
-    local pid
-    pid=$(ss -tlnp "sport = :$PORT_ADMIN" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1) || true
-    [[ -n "$pid" ]]
+    local ports=($PORT_HTTP $PORT_HTTPS $PORT_ADMIN)
+    local seen=()
+    for port in "${ports[@]}"; do
+        [[ " ${seen[*]} " =~ " $port " ]] && continue; seen+=("$port")
+        local pid
+        pid=$(ss -tlnp "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1) || true
+        [[ -n "$pid" ]] && return 0
+    done
+    return 1
 }
 
 resolve_port_conflicts() {
     # 隔离原则: 绝不停止或禁用其他服务，仅提示用户修改 NPM 端口
     section "端口冲突"
-    local pid
-    pid=$(ss -tlnp "sport = :$PORT_ADMIN" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1) || true
-    if [[ -n "$pid" ]]; then
-        local proc; proc=$(ps -p "$pid" -o comm= 2>/dev/null || echo "未知")
-        warn "管理端口 $PORT_ADMIN 被 $proc (PID:$pid) 占用"
-    fi
+    local ports=($PORT_HTTP $PORT_HTTPS $PORT_ADMIN)
+    local seen=()
+    for port in "${ports[@]}"; do
+        [[ " ${seen[*]} " =~ " $port " ]] && continue; seen+=("$port")
+        local pid
+        pid=$(ss -tlnp "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1) || true
+        if [[ -n "$pid" ]]; then
+            local proc; proc=$(ps -p "$pid" -o comm= 2>/dev/null || echo "未知")
+            warn "端口 $port 被 $proc (PID:$pid) 占用"
+        fi
+    done
     echo ""
-    warn "NPM 不会停止其他服务。请修改管理面板端口以避免冲突。"
-    info "建议: 管理→8181"
+    warn "NPM 不会停止其他服务。请修改 NPM 端口以避免冲突。"
+    info "建议: HTTP→8080, HTTPS→8443, 管理→8181"
     return 1  # 返回 false 触发重新配置端口
 }
 
 configure_ports() {
     header "端口自定义配置"
-    echo -e "  ${DIM}HTTP/HTTPS 代理端口由后端模板固定为 80/443${NC}"
-    echo -e "  ${DIM}后端 API 端口固定为 3000${NC}"
+    echo -e "  ${DIM}后端 API 端口固定为 3000 (不修改源码)${NC}"
+    echo -e "  ${DIM}HTTP/HTTPS 自定义端口通过 nginx stream 转发到内部 80/443${NC}"
     spacer
-    echo -e "  管理后台: ${CYAN}$PORT_ADMIN${NC}"
+    echo -e "  HTTP: ${CYAN}$PORT_HTTP${NC}  HTTPS: ${CYAN}$PORT_HTTPS${NC}  管理: ${CYAN}$PORT_ADMIN${NC}"
     spacer
-    confirm "是否修改管理后台端口？" "n" || { log "使用默认端口"; return; }
+    confirm "是否修改端口？" "n" || { log "使用默认端口"; return; }
 
+    PORT_HTTP=$(read_port "HTTP 代理端口 (用户访问域名时使用的端口)" "$PORT_HTTP")
+    PORT_HTTPS=$(read_port "HTTPS 代理端口" "$PORT_HTTPS")
     PORT_ADMIN=$(read_port "管理后台端口" "$PORT_ADMIN")
 
+    if [[ "$PORT_HTTP" == "$PORT_ADMIN" || "$PORT_HTTP" == "$PORT_HTTPS" || "$PORT_ADMIN" == "$PORT_HTTPS" ]]; then
+        warn "端口不能相同"; spacer; configure_ports; return
+    fi
     spacer
-    echo -e "  管理后台: ${CYAN}$PORT_ADMIN${NC}"
+    echo -e "  HTTP: ${CYAN}$PORT_HTTP${NC}  HTTPS: ${CYAN}$PORT_HTTPS${NC}  管理: ${CYAN}$PORT_ADMIN${NC}"
     confirm "确认？" "y" || configure_ports
 }
 
@@ -717,6 +741,54 @@ EOF
         fi
     fi
 
+    # ─── 自定义端口转发 (stream 块) ──────────────────────────────
+    # 后端模板硬编码 listen 80 / listen 443，不修改源码
+    # 当用户自定义端口时，通过 stream {} 透明转发到内部 80/443
+    local stream_fwd="$NGINX_CONF_DIR/npm-stream-fwd.conf"
+    rm -f "$stream_fwd"  # 清理旧配置
+    if [[ "$PORT_HTTP" -ne 80 || "$PORT_HTTPS" -ne 443 ]]; then
+        cat > "$stream_fwd" << STREAM_FWD
+# NPM 自定义端口转发 (由 setup.sh 自动生成)
+# 将用户自定义端口的流量透明转发到 nginx 内部 80/443
+stream {
+STREAM_FWD
+        if [[ "$PORT_HTTPS" -ne 443 ]]; then
+            cat >> "$stream_fwd" << STREAM_FWD
+    map \$ssl_preread_server_name \$npm_fwd_https {
+        default 127.0.0.1:443;
+    }
+    server {
+        listen ${PORT_HTTPS};
+        listen [::]:${PORT_HTTPS};
+        proxy_pass \$npm_fwd_https;
+        ssl_preread on;
+    }
+STREAM_FWD
+        fi
+        if [[ "$PORT_HTTP" -ne 80 ]]; then
+            cat >> "$stream_fwd" << STREAM_FWD
+    server {
+        listen ${PORT_HTTP};
+        listen [::]:${PORT_HTTP};
+        proxy_pass 127.0.0.1:80;
+    }
+STREAM_FWD
+        fi
+        echo "}" >> "$stream_fwd"
+        chown "$NPM_USER:$NPM_GROUP" "$stream_fwd"
+
+        # 在 nginx.conf 顶层注入 stream include (如果尚未存在)
+        local nc2="/etc/nginx/nginx.conf"
+        if [[ -f "$nc2" ]] && ! grep -q 'npm-stream-fwd' "$nc2" 2>/dev/null; then
+            # 在文件第一行之后插入 (避免放在 shebang 之前)
+            sed -i '1 a\include /etc/nginx/npm-conf.d/npm-stream-fwd.conf;' "$nc2"
+            log "已注入 stream 端口转发 ($PORT_HTTP→80, $PORT_HTTPS→443)"
+        fi
+    else
+        # 默认端口，清理可能残留的顶层 stream include
+        sed -i '/npm-stream-fwd/d' /etc/nginx/nginx.conf 2>/dev/null || true
+    fi
+
     # nginx 配置测试 (显示完整错误信息便于排查)
     local nginx_test_output
     if nginx_test_output=$(nginx -t 2>&1); then
@@ -855,7 +927,7 @@ run_install() {
     spacer
     echo -e "${BOLD}安装概要:${NC}"
     echo -e "  安装目录: ${CYAN}$NPM_DIR${NC}  数据: ${CYAN}$DATA_DIR${NC}"
-    echo -e "  管理: ${CYAN}$PORT_ADMIN${NC}  HTTP: ${DIM}80${NC}  HTTPS: ${DIM}443${NC}  后端: ${DIM}3000${NC}"
+    echo -e "  HTTP: ${CYAN}$PORT_HTTP${NC}  HTTPS: ${CYAN}$PORT_HTTPS${NC}  管理: ${CYAN}$PORT_ADMIN${NC}  后端: ${DIM}3000${NC}"
     echo -e "  源码修改: ${GREEN}无${NC}  Wrapper: ${GREEN}dpkg-divert${NC}"
     spacer
     confirm "确认安装？" "y" || exit 1
@@ -1067,9 +1139,9 @@ show_status() {
     echo -ne "  ${BOLD}数据目录:${NC}  "; [[ -d "$DATA_DIR" ]] && echo -e "${GREEN}$DATA_DIR ($(du -sh "$DATA_DIR" 2>/dev/null | cut -f1))${NC}" || echo -e "${DIM}-${NC}"
     spacer
     header "端口"
-    echo -e "  管理: ${CYAN}$PORT_ADMIN${NC}  HTTP: ${DIM}80${NC}  HTTPS: ${DIM}443${NC}  后端: ${DIM}3000${NC}"
+    echo -e "  HTTP: ${CYAN}$PORT_HTTP${NC}  HTTPS: ${CYAN}$PORT_HTTPS${NC}  管理: ${CYAN}$PORT_ADMIN${NC}  后端: ${DIM}3000${NC}"
     spacer
-    for port in $PORT_ADMIN 80 443 3000; do
+    for port in $PORT_HTTP $PORT_HTTPS $PORT_ADMIN 3000; do
         echo -ne "  端口 $port: "
         if ss -tlnp "sport = :$port" 2>/dev/null | grep -q LISTEN; then
             local p; p=$(ss -tlnp "sport = :$port" 2>/dev/null | grep -oP 'users:\(\("?\K[^"]+' | head -1)
