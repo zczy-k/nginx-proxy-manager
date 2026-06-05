@@ -211,23 +211,36 @@ detect_certbot() {
 # ═══════════════════════════════════════════════════════════════
 # 冲突解决
 # ═══════════════════════════════════════════════════════════════
-resolve_port_conflicts() {
-    local ports=($PORT_HTTP $PORT_HTTPS $PORT_ADMIN); local resolved=false
+has_port_conflicts() {
+    local ports=($PORT_HTTP $PORT_HTTPS $PORT_ADMIN)
     local seen=()
     for port in "${ports[@]}"; do
         [[ " ${seen[*]} " =~ " $port " ]] && continue; seen+=("$port")
-        local pid; pid=$(ss -tlnp "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1) || true
-        [[ -z "$pid" ]] && continue
-        local unit; unit=$(systemctl status "$pid" 2>/dev/null | grep -oP '● \K[^. ]+' | head -1) || true
-        if [[ -n "$unit" ]]; then
-            systemctl stop "$unit" 2>/dev/null || true
-            systemctl disable "$unit" 2>/dev/null || true
-            resolved=true; log "已释放端口 $port (停用 $unit)"
-        else
-            warn "端口 $port 被 PID:$pid 占用，无法自动释放 → kill $pid"
+        local pid
+        pid=$(ss -tlnp "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1) || true
+        [[ -n "$pid" ]] && return 0
+    done
+    return 1
+}
+
+resolve_port_conflicts() {
+    # 隔离原则: 绝不停止或禁用其他服务，仅提示用户修改 NPM 端口
+    section "端口冲突"
+    local ports=($PORT_HTTP $PORT_HTTPS $PORT_ADMIN)
+    local seen=()
+    for port in "${ports[@]}"; do
+        [[ " ${seen[*]} " =~ " $port " ]] && continue; seen+=("$port")
+        local pid
+        pid=$(ss -tlnp "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1) || true
+        if [[ -n "$pid" ]]; then
+            local proc; proc=$(ps -p "$pid" -o comm= 2>/dev/null || echo "未知")
+            warn "端口 $port 被 $proc (PID:$pid) 占用"
         fi
     done
-    $resolved
+    echo ""
+    warn "NPM 不会停止其他服务。请修改 NPM 端口以避免冲突。"
+    info "建议: HTTP→8080, HTTPS→8443, 管理→8181"
+    return 1  # 返回 false 触发重新配置端口
 }
 
 configure_ports() {
@@ -284,12 +297,20 @@ cleanup_old_install() {
 # ═══════════════════════════════════════════════════════════════
 install_dependencies() {
     section "安装系统依赖"
+    # 安装前记录 nginx 状态，避免 apt 安装 nginx 时自动启动/重启干扰已有服务
+    local nginx_was_active=false
+    systemctl is-active nginx &>/dev/null 2>&1 && nginx_was_active=true
     apt-get update -qq
     apt-get install -y --no-install-recommends \
         nginx certbot python3 python3-venv python3-certbot-nginx \
         git curl jq logrotate ca-certificates sqlite3 lsof sudo \
         build-essential \
         > /dev/null
+    # 如果 nginx 之前未运行，apt 安装后可能会自动启动 — 保持原状态
+    if ! $nginx_was_active && systemctl is-active nginx &>/dev/null 2>&1; then
+        systemctl stop nginx 2>/dev/null || true
+        info "已停止 apt 自动启动的 nginx (将在安装流程中按需启动)"
+    fi
     log "系统依赖安装完成"
 
     if [[ ! -f /opt/certbot/bin/activate ]]; then
@@ -488,21 +509,33 @@ download_prebuilt() {
 create_data_dirs() {
     section "创建数据目录"
     mkdir -p "$DATA_DIR" "$LOG_DIR"
-    # 后端硬编码 /data/keys.json，需要 npm 用户可写 /data/
-    chown "$NPM_USER:$NPM_GROUP" /data 2>/dev/null || true
-    # 后端模板引用的运行时目录
+
+    # /data 目录: 不修改父目录所有权 (其他项目可能共享 /data)
+    # 仅确保 NPM 专属子目录权限正确
     mkdir -p /data/logs /data/custom_ssl /data/access /data/nginx/default_www
     mkdir -p /data/letsencrypt-acme-challenge
     mkdir -p "$NGINX_DATA_DIR"/{custom,proxy_host,redirection_host,stream,dead_host,temp,default_host}
     chown "$NPM_USER:$NPM_GROUP" /data/logs /data/custom_ssl /data/access /data/letsencrypt-acme-challenge
     chown -R "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR" "$DATA_DIR"
+
+    # /data/keys.json: 后端硬编码写入此文件，仅需 npm 用户可写
+    if [[ ! -f /data/keys.json ]]; then
+        touch /data/keys.json
+        chown "$NPM_USER:$NPM_GROUP" /data/keys.json
+    fi
+
     # 日志目录: npm 后端和 nginx worker (www-data) 都需要写入
     chown "$NPM_USER:www-data" "$LOG_DIR"
     chmod 775 "$LOG_DIR"
-    # Let's Encrypt (certbot 需要完整目录权限)
+
+    # Let's Encrypt: 仅设置 NPM 专属子目录权限
+    # 不修改 /etc/letsencrypt 父目录所有权 (其他项目的 certbot 可能在使用)
     mkdir -p /etc/letsencrypt/credentials /etc/letsencrypt/live /etc/letsencrypt/archive /etc/letsencrypt/renewal /etc/letsencrypt/accounts
-    chown -R "$NPM_USER:$NPM_GROUP" /etc/letsencrypt 2>/dev/null || true
-    # certbot 配置文件 (从 Docker rootfs 复制或手动生成)
+    for le_subdir in credentials live archive renewal accounts; do
+        chown "$NPM_USER:$NPM_GROUP" "/etc/letsencrypt/$le_subdir" 2>/dev/null || true
+    done
+
+    # certbot 配置文件
     if [[ ! -f /etc/letsencrypt.ini ]] || [[ ! -s /etc/letsencrypt.ini ]]; then
         if [[ -f "$NPM_DIR/docker/rootfs/etc/letsencrypt.ini" ]]; then
             cp "$NPM_DIR/docker/rootfs/etc/letsencrypt.ini" /etc/letsencrypt.ini
@@ -789,7 +822,19 @@ LOGROTATE
 
 start_services() {
     section "启动服务"
-    systemctl enable nginx; systemctl start nginx || true
+    # Nginx: 不强制 enable (用户可能通过其他方式管理 nginx 启停)
+    # 仅在 nginx 已设为开机启动时才确保其运行中
+    if systemctl is-enabled nginx &>/dev/null 2>&1; then
+        systemctl start nginx || true
+        log "Nginx 已启动 (保持已启用状态)"
+    elif systemctl is-active nginx &>/dev/null 2>&1; then
+        log "Nginx 已在运行中 (未修改启停设置)"
+    else
+        systemctl start nginx || true
+        info "Nginx 已启动 (未设置开机自启，如需自启请运行: systemctl enable nginx)"
+    fi
+
+    # NPM 后端: 启用并启动
     systemctl enable npm-backend; systemctl start npm-backend || true
     info "等待后端启动 (首次需执行数据库迁移) ..."
     local waited=0 max_wait=30
@@ -821,7 +866,13 @@ run_install() {
     section "端口配置"; configure_ports; spacer
 
     if $has_conflicts; then
-        section "冲突解决"; confirm "自动解决端口冲突？" "y" && resolve_port_conflicts || true; spacer
+        while has_port_conflicts; do
+            section "冲突解决"
+            resolve_port_conflicts
+            configure_ports
+        done
+        log "所有端口冲突已解决"
+        spacer
     fi
 
     spacer
