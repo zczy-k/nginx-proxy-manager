@@ -410,9 +410,31 @@ port_in_use() {
     ss -ltn "sport = :$port" 2>/dev/null | awk 'NR > 1 { print $4 }' | grep -q .
 }
 
+port_listener_summary() {
+    local port="$1"
+    local details=""
+
+    if command_exists lsof; then
+        details="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+        if [[ -n "$details" ]]; then
+            printf '%s\n' "$details"
+            return 0
+        fi
+    fi
+
+    details="$(ss -ltnp "sport = :$port" 2>/dev/null || true)"
+    if [[ -n "$details" ]]; then
+        printf '%s\n' "$details"
+        return 0
+    fi
+
+    return 1
+}
+
 ensure_proxy_ports_free() {
     local ports=(80 443 "$ADMIN_PORT")
     local seen=""
+    local details=""
     if [[ "$ADMIN_PORT" == "80" || "$ADMIN_PORT" == "443" ]]; then
         die "管理后台端口不能是 80 或 443"
     fi
@@ -420,8 +442,17 @@ ensure_proxy_ports_free() {
         [[ " $seen " == *" $port "* ]] && continue
         seen+=" $port"
         if port_in_use "$port"; then
+            details="$(port_listener_summary "$port" || true)"
             if [[ "$port" == "$ADMIN_PORT" ]]; then
+                if [[ -n "$details" ]]; then
+                    die "管理后台端口 $ADMIN_PORT 已被占用。监听信息：
+$details"
+                fi
                 die "管理后台端口 $ADMIN_PORT 已被占用"
+            fi
+            if [[ -n "$details" ]]; then
+                die "端口 $port 已被占用。裸机版 NPM 必须独占 80 和 443。监听信息：
+$details"
             fi
             die "端口 $port 已被占用。裸机版 NPM 必须独占 80 和 443"
         fi
