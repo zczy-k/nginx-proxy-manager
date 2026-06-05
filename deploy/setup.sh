@@ -577,11 +577,13 @@ create_data_dirs() {
     chown "$NPM_USER:$NPM_GROUP" /data/logs /data/custom_ssl /data/access /data/letsencrypt-acme-challenge
     chown -R "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR" "$DATA_DIR"
 
-    # /data/keys.json: 后端硬编码写入此文件，仅需 npm 用户可写
-    if [[ ! -f /data/keys.json ]]; then
-        touch /data/keys.json
-        chown "$NPM_USER:$NPM_GROUP" /data/keys.json
+    # /data/keys.json: 后端硬编码读写此文件用于 JWT 密钥对
+    # npm 用户无法在 /data/ 下创建文件 (root 所有), 需预制有效 JSON
+    # 空文件会导致 JSON.parse('') → SyntaxError → 后端反复崩溃重启
+    if [[ ! -f /data/keys.json ]] || [[ ! -s /data/keys.json ]]; then
+        echo '{}' > /data/keys.json
     fi
+    chown "$NPM_USER:$NPM_GROUP" /data/keys.json
 
     # 日志目录: npm 后端和 nginx worker (www-data) 都需要写入
     chown "$NPM_USER:www-data" "$LOG_DIR"
