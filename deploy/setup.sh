@@ -571,11 +571,21 @@ NGINX_CONF
 
     # 复制 Docker fallback server (定义 $server/$forward_scheme/$port 变量)
     # log_format 和 proxy.conf 引用这些变量，没有 fallback 会导致 unknown variable 错误
+    # 仅保留 port 80 块 (提供变量定义)，port 443 块需要 ssl_reject_handshake (nginx 1.19.4+)
+    # 或 ssl_certificate，与用户已有的 443 server 冲突，故移除
     local docker_default="$NPM_DIR/docker/rootfs/etc/nginx/conf.d/default.conf"
     if [[ -f "$docker_default" ]]; then
-        cp "$docker_default" "$NGINX_CONF_DIR/npm-default.conf"
-        # ssl_reject_handshake 需要 nginx 1.19.4+，Ubuntu 22.04 自带 1.18 不支持
-        # return 444 已在同一 server 块中，效果等价
+        # 只提取第一个 server 块 (port 80)，丢弃 443 块
+        awk '
+        /^\s*server\s*\{/ { depth=0; buf=""; capturing=1 }
+        capturing {
+            buf = buf $0 "\n"
+            depth += gsub(/{/, "{")
+            depth -= gsub(/}/, "}")
+            if (depth <= 0) { print buf; capturing=0 }
+        }
+        ' "$docker_default" > "$NGINX_CONF_DIR/npm-default.conf"
+        # 移除不兼容指令 (nginx < 1.19.4)
         sed -i '/ssl_reject_handshake/d' "$NGINX_CONF_DIR/npm-default.conf"
     fi
 
