@@ -486,16 +486,18 @@ download_prebuilt() {
         warn "未找到后端产物"; return 1
     fi
 
-    # 解压前端
+    # 解压前端 (先清理旧 dist 避免残留)
     section "安装预构建产物"
     info "解压前端 ..."
+    rm -rf "$NPM_DIR/frontend/dist" 2>/dev/null || true
     mkdir -p "$NPM_DIR/frontend/dist"
     tar xzf /tmp/frontend-dist.tar.gz -C "$NPM_DIR/frontend/"
     chown -R "$NPM_USER:$NPM_GROUP" "$NPM_DIR/frontend/dist"
     log "前端已安装 (预构建)"
 
-    # 解压后端 node_modules
+    # 解压后端 node_modules (先清理旧依赖避免残留冲突)
     info "解压后端原生模块 ..."
+    rm -rf "$NPM_DIR/backend/node_modules" 2>/dev/null || true
     tar xzf /tmp/backend-modules.tar.gz -C "$NPM_DIR/backend/"
     chown -R "$NPM_USER:$NPM_GROUP" "$NPM_DIR/backend/node_modules"
     log "后端依赖已安装 (预构建)"
@@ -744,8 +746,11 @@ EOF
     # ─── 自定义端口转发 (stream 块) ──────────────────────────────
     # 后端模板硬编码 listen 80 / listen 443，不修改源码
     # 当用户自定义端口时，通过 stream {} 透明转发到内部 80/443
-    local stream_fwd="$NGINX_CONF_DIR/npm-stream-fwd.conf"
+    # 注意: stream 文件必须放在 npm-conf.d 之外，因为 npm-conf.d 被 http {} include
+    local stream_fwd="/etc/nginx/npm-stream-fwd.conf"
     rm -f "$stream_fwd"  # 清理旧配置
+    # 也清理旧版可能留在 npm-conf.d 内的文件
+    rm -f "$NGINX_CONF_DIR/npm-stream-fwd.conf"
     if [[ "$PORT_HTTP" -ne 80 || "$PORT_HTTPS" -ne 443 ]]; then
         cat > "$stream_fwd" << STREAM_FWD
 # NPM 自定义端口转发 (由 setup.sh 自动生成)
@@ -781,11 +786,11 @@ STREAM_FWD
         local nc2="/etc/nginx/nginx.conf"
         if [[ -f "$nc2" ]] && ! grep -q 'npm-stream-fwd' "$nc2" 2>/dev/null; then
             # 在文件第一行之后插入 (避免放在 shebang 之前)
-            sed -i '1 a\include /etc/nginx/npm-conf.d/npm-stream-fwd.conf;' "$nc2"
+            sed -i '1 a\include /etc/nginx/npm-stream-fwd.conf;' "$nc2"
             log "已注入 stream 端口转发 ($PORT_HTTP→80, $PORT_HTTPS→443)"
         fi
     else
-        # 默认端口，清理可能残留的顶层 stream include
+        # 默认端口，清理可能残留的 stream include 和文件
         sed -i '/npm-stream-fwd/d' /etc/nginx/nginx.conf 2>/dev/null || true
     fi
 
@@ -884,16 +889,31 @@ start_services() {
     fi
 
     # NPM 后端: 启用并启动
-    systemctl enable npm-backend; systemctl start npm-backend || true
+    systemctl enable npm-backend
+    systemctl start npm-backend 2>/dev/null || {
+        local exit_code=$?
+        warn "npm-backend 启动失败 (exit code: $exit_code)"
+        warn "最近日志:"
+        journalctl -u npm-backend -n 15 --no-pager 2>/dev/null | while IFS= read -r line; do warn "  $line"; done
+        return
+    }
     info "等待后端启动 (首次需执行数据库迁移) ..."
     local waited=0 max_wait=30
     while [[ $waited -lt $max_wait ]]; do
         sleep 2; waited=$((waited + 2))
-        systemctl is-active npm-backend &>/dev/null && { log "后端运行中 (${waited}s)"; return; }
+        if systemctl is-active npm-backend &>/dev/null; then
+            log "后端运行中 (${waited}s)"; return
+        fi
+        # 检查是否已经失败退出了
+        if systemctl is-failed npm-backend &>/dev/null 2>&1; then
+            warn "后端在 ${waited}s 内异常退出:"
+            journalctl -u npm-backend -n 20 --no-pager 2>/dev/null | while IFS= read -r line; do warn "  $line"; done
+            return
+        fi
         echo -ne "${DIM}  已等待 ${waited}s ...${NC}\r"
     done
-    warn "${max_wait}s 内未就绪 (可能仍在迁移中)"
-    info "journalctl -u npm-backend -n 50 --no-pager"
+    warn "${max_wait}s 内未就绪 (可能仍在执行数据库迁移)"
+    info "查看日志: journalctl -u npm-backend -n 50 --no-pager"
 }
 
 # ═══════════════════════════════════════════════════════════════
