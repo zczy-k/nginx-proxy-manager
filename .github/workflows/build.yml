@@ -1,0 +1,93 @@
+# ═══════════════════════════════════════════════════════════════
+# NPM Bare-Metal: 预构建前端 + 后端原生模块
+# 产物上传为 GitHub Release，部署脚本直接下载
+# ═══════════════════════════════════════════════════════════════
+name: Build Release Assets
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      # ─── 前端构建 ──────────────────────────────────────
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm install --no-audit --no-fund
+
+      - name: Build frontend (Vite)
+        working-directory: frontend
+        run: npm run build
+
+      # ─── 后端原生模块 ──────────────────────────────────
+      - name: Install backend dependencies (Linux native modules)
+        working-directory: backend
+        run: npm install --no-audit --no-fund
+
+      - name: Remove unnecessary DB drivers
+        working-directory: backend
+        run: npm uninstall mysql2 pg sqlite3 --no-save --no-audit --no-fund
+
+      # ─── 打包 ──────────────────────────────────────────
+      - name: Package frontend dist
+        run: |
+          tar czf frontend-dist.tar.gz -C frontend dist
+
+      - name: Package backend node_modules
+        run: |
+          tar czf backend-modules.tar.gz \
+            --exclude='*.md' \
+            --exclude='.package-lock.json' \
+            --exclude='package-lock.json' \
+            -C backend node_modules
+
+      - name: Create build metadata
+        run: |
+          cat > build-info.json << EOF
+          {
+            "commit": "${{ github.sha }}",
+            "branch": "${{ github.ref_name }}",
+            "node_version": "$(node --version)",
+            "build_time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "runner": "ubuntu-latest"
+          }
+          EOF
+          cat build-info.json
+
+      # ─── 发布 ──────────────────────────────────────────
+      - name: Delete previous build-latest release (if exists)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete build-latest --yes 2>/dev/null || true
+          git push --delete origin build-latest 2>/dev/null || true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create build-latest \
+            frontend-dist.tar.gz \
+            backend-modules.tar.gz \
+            build-info.json \
+            --title "Build $(date -u +%Y%m%d-%H%M%S)" \
+            --notes "Automated build from ${{ github.ref_name }} (${{ github.sha }})"

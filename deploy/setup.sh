@@ -393,6 +393,98 @@ build_frontend() {
     log "前端构建完成"
 }
 
+# ─── 从 GitHub Release 下载预构建产物 ─────────────────────────
+# 避免在低配服务器上编译前端和原生模块
+download_prebuilt() {
+    section "下载预构建产物"
+    local release_tag="build-latest"
+    local api_url="https://api.github.com/repos/${GIT_REPO#*://*/}/releases/tags/${release_tag}"
+    # 兼容 https://github.com/user/repo.git 和 https://github.com/user/repo 两种格式
+    local repo_path
+    repo_path=$(echo "$GIT_REPO" | sed -E 's|https?://github\.com/||; s|\.git$||')
+    api_url="https://api.github.com/repos/${repo_path}/releases/tags/${release_tag}"
+
+    info "检查 GitHub Release (${release_tag}) ..."
+
+    # 获取 release 信息
+    local release_json
+    release_json=$(curl -sL -H "Accept: application/vnd.github+json" "$api_url" 2>/dev/null) || {
+        warn "无法访问 GitHub API"; return 1
+    }
+
+    # 检查是否有效
+    if echo "$release_json" | jq -e '.message' &>/dev/null; then
+        warn "未找到预构建产物 (${release_tag})"
+        return 1
+    fi
+
+    # 显示构建信息
+    local build_info_url
+    build_info_url=$(echo "$release_json" | jq -r '.assets[] | select(.name == "build-info.json") | .browser_download_url' 2>/dev/null)
+    if [[ -n "$build_info_url" && "$build_info_url" != "null" ]]; then
+        local build_info
+        build_info=$(curl -sL "$build_info_url" 2>/dev/null)
+        local build_node build_time
+        build_node=$(echo "$build_info" | jq -r '.node_version // "unknown"')
+        build_time=$(echo "$build_info" | jq -r '.build_time // "unknown"')
+        info "构建信息: Node ${build_node} | ${build_time}"
+
+        # 检查 Node.js 版本是否匹配
+        local local_node
+        local_node=$(node --version 2>/dev/null || echo "none")
+        local build_major local_major
+        build_major=$(echo "$build_node" | grep -oP 'v\K[0-9]+' || echo "0")
+        local_major=$(echo "$local_node" | grep -oP 'v\K[0-9]+' || echo "0")
+        if [[ "$build_major" != "$local_major" ]]; then
+            warn "Node.js 版本不匹配 (本地: ${local_node}, 构建: ${build_node})"
+            warn "原生模块可能不兼容，回退到本地构建"
+            return 1
+        fi
+    fi
+
+    # 下载前端 dist
+    local frontend_url
+    frontend_url=$(echo "$release_json" | jq -r '.assets[] | select(.name == "frontend-dist.tar.gz") | .browser_download_url' 2>/dev/null)
+    if [[ -n "$frontend_url" && "$frontend_url" != "null" ]]; then
+        info "下载前端产物 ..."
+        curl -sL "$frontend_url" -o /tmp/frontend-dist.tar.gz &
+        spinner $! "frontend-dist.tar.gz" || { warn "前端下载失败"; return 1; }
+    else
+        warn "未找到前端产物"; return 1
+    fi
+
+    # 下载后端 node_modules
+    local backend_url
+    backend_url=$(echo "$release_json" | jq -r '.assets[] | select(.name == "backend-modules.tar.gz") | .browser_download_url' 2>/dev/null)
+    if [[ -n "$backend_url" && "$backend_url" != "null" ]]; then
+        info "下载后端产物 ..."
+        curl -sL "$backend_url" -o /tmp/backend-modules.tar.gz &
+        spinner $! "backend-modules.tar.gz" || { warn "后端下载失败"; return 1; }
+    else
+        warn "未找到后端产物"; return 1
+    fi
+
+    # 解压前端
+    section "安装预构建产物"
+    info "解压前端 ..."
+    mkdir -p "$NPM_DIR/frontend/dist"
+    tar xzf /tmp/frontend-dist.tar.gz -C "$NPM_DIR/frontend/"
+    chown -R "$NPM_USER:$NPM_GROUP" "$NPM_DIR/frontend/dist"
+    log "前端已安装 (预构建)"
+
+    # 解压后端 node_modules
+    info "解压后端原生模块 ..."
+    tar xzf /tmp/backend-modules.tar.gz -C "$NPM_DIR/backend/"
+    chown -R "$NPM_USER:$NPM_GROUP" "$NPM_DIR/backend/node_modules"
+    log "后端依赖已安装 (预构建)"
+
+    # 清理临时文件
+    rm -f /tmp/frontend-dist.tar.gz /tmp/backend-modules.tar.gz
+
+    log "预构建产物安装完成"
+    return 0
+}
+
 create_data_dirs() {
     section "创建数据目录"
     mkdir -p "$DATA_DIR" "$LOG_DIR"
@@ -682,8 +774,16 @@ run_install() {
     install_nodejs
     create_user
     clone_project
-    install_node_deps || { error "后端依赖安装失败，请检查日志"; exit 1; }
-    build_frontend || { error "前端构建失败，安装中止"; exit 1; }
+
+    # 优先下载预构建产物，失败时回退到本地构建
+    if [[ "${FORCE_LOCAL_BUILD:-}" != "1" ]] && download_prebuilt; then
+        log "使用预构建产物 (跳过本地编译)"
+    else
+        warn "回退到本地构建 (在 2C1G 上可能需要 5-10 分钟)"
+        install_node_deps || { error "后端依赖安装失败，请检查日志"; exit 1; }
+        build_frontend || { error "前端构建失败，安装中止"; exit 1; }
+    fi
+
     create_data_dirs
     configure_nginx
     install_nginx_wrapper
@@ -785,18 +885,24 @@ upgrade_npm() {
     esac
 
     section "重新安装依赖"
-    # 修复 npm 缓存目录权限
-    chown -R "$NPM_USER:$NPM_GROUP" "$NPM_DIR/.npm" 2>/dev/null || true
-    cd "$NPM_DIR/backend"
-    su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm install --no-audit --no-fund" &
-    spinner $! "npm install (backend)" || { error "后端依赖安装失败"; systemctl start npm-backend 2>/dev/null || true; return 1; }
-    su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm uninstall mysql2 pg sqlite3 --no-save --no-audit --no-fund" 2>/dev/null || true
+    # 优先下载预构建产物
+    if [[ "${FORCE_LOCAL_BUILD:-}" != "1" ]] && download_prebuilt; then
+        log "使用预构建产物 (跳过本地编译)"
+    else
+        warn "回退到本地构建"
+        # 修复 npm 缓存目录权限
+        chown -R "$NPM_USER:$NPM_GROUP" "$NPM_DIR/.npm" 2>/dev/null || true
+        cd "$NPM_DIR/backend"
+        su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm install --no-audit --no-fund" &
+        spinner $! "npm install (backend)" || { error "后端依赖安装失败"; systemctl start npm-backend 2>/dev/null || true; return 1; }
+        su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm uninstall mysql2 pg sqlite3 --no-save --no-audit --no-fund" 2>/dev/null || true
 
-    section "重新构建前端"
-    rm -rf "$NPM_DIR/frontend/dist" 2>/dev/null || true
-    su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/frontend' && npm install --no-audit --no-fund" &
-    spinner $! "npm install (frontend)" || { error "前端依赖安装失败"; systemctl start npm-backend 2>/dev/null || true; return 1; }
-    su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/frontend' && npm run build" 2>&1 | tail -10 || { error "前端构建失败"; systemctl start npm-backend 2>/dev/null || true; return 1; }
+        section "重新构建前端"
+        rm -rf "$NPM_DIR/frontend/dist" 2>/dev/null || true
+        su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/frontend' && npm install --no-audit --no-fund" &
+        spinner $! "npm install (frontend)" || { error "前端依赖安装失败"; systemctl start npm-backend 2>/dev/null || true; return 1; }
+        su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/frontend' && npm run build" 2>&1 | tail -10 || { error "前端构建失败"; systemctl start npm-backend 2>/dev/null || true; return 1; }
+    fi
 
     section "重启服务"
     systemctl start npm-backend
@@ -909,18 +1015,20 @@ main_menu() {
 
 case "${1:-}" in
     install|-i)  run_install ;;
+    install-local) FORCE_LOCAL_BUILD=1 run_install ;;
     uninstall|-u) uninstall_npm ;;
     upgrade)     upgrade_npm ;;
     health|--health) health_check ;;
     status|-s)   show_status ;;
     --help|-h)
         echo -e "${CYAN}NPM Bare-Metal 部署工具 v${SCRIPT_VERSION}${NC}"
-        echo "  bash deploy/setup.sh             交互菜单"
-        echo "  bash deploy/setup.sh install     安装"
-        echo "  bash deploy/setup.sh uninstall   卸载"
-        echo "  bash deploy/setup.sh upgrade     升级"
-        echo "  bash deploy/setup.sh health      健康检查"
-        echo "  bash deploy/setup.sh status      状态"
+        echo "  bash deploy/setup.sh              交互菜单"
+        echo "  bash deploy/setup.sh install      安装 (优先下载预构建)"
+        echo "  bash deploy/setup.sh install-local 安装 (强制本地编译)"
+        echo "  bash deploy/setup.sh uninstall    卸载"
+        echo "  bash deploy/setup.sh upgrade      升级"
+        echo "  bash deploy/setup.sh health       健康检查"
+        echo "  bash deploy/setup.sh status       状态"
         ;;
     *) main_menu ;;
 esac
