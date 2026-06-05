@@ -578,10 +578,32 @@ create_data_dirs() {
     chown -R "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR" "$DATA_DIR"
 
     # /data/keys.json: 后端硬编码读写此文件用于 JWT 密钥对
-    # npm 用户无法在 /data/ 下创建文件 (root 所有), 需预制有效 JSON
-    # 空文件会导致 JSON.parse('') → SyntaxError → 后端反复崩溃重启
-    if [[ ! -f /data/keys.json ]] || [[ ! -s /data/keys.json ]]; then
-        echo '{}' > /data/keys.json
+    # npm 用户无法在 /data/ 下创建文件 (root 所有), 需预制有效密钥对
+    # 
+    # 重要: 不能预制 {} 空对象! 后端 getKeys() 仅在文件不存在时生成密钥,
+    # 文件存在但无有效 key/pub 字段 → getPublicKey() 返回 undefined
+    # → Token.load() 报 "Public key is empty!" → 所有认证 API 返回 500
+    if [[ -f /data/keys.json ]]; then
+        # 已有文件但密钥无效 (无 PEM 私钥头) → 删除, 触发重新生成
+        if ! grep -q 'BEGIN.*PRIVATE KEY' /data/keys.json 2>/dev/null; then
+            warn "/data/keys.json 密钥无效, 重新生成..."
+            rm -f /data/keys.json
+        fi
+    fi
+    if [[ ! -f /data/keys.json ]]; then
+        # 使用 Node.js 内置 crypto 生成 RSA-2048 密钥对
+        # (node-rsa exportKey('private') → PKCS#1, exportKey('public') → SPKI)
+        node -e "
+            const crypto = require('crypto');
+            const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
+                modulusLength: 2048,
+                publicKeyEncoding:  { type: 'spki',  format: 'pem' },
+                privateKeyEncoding: { type: 'pkcs1', format: 'pem' }
+            });
+            require('fs').writeFileSync('/data/keys.json',
+                JSON.stringify({ key: privateKey, pub: publicKey }, null, 2));
+        " || { error "JWT 密钥生成失败"; return 1; }
+        log "已生成 JWT 密钥对: /data/keys.json"
     fi
     chown "$NPM_USER:$NPM_GROUP" /data/keys.json
 
