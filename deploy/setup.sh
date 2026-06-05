@@ -267,6 +267,9 @@ cleanup_old_install() {
     }
     [[ -d "$NGINX_CONF_DIR" ]] && { rm -rf "$NGINX_CONF_DIR"; log "已清理 Nginx 配置"; }
     [[ -d /etc/nginx/conf.d/include ]] && { rm -rf /etc/nginx/conf.d/include; log "已清理 Nginx include 片段"; }
+    # 清理 nginx.conf 中残余的 NPM include 注入
+    sed -i '/npm-conf\.d/d' /etc/nginx/nginx.conf 2>/dev/null || true
+    sed -i '/http_top\.conf/d' /etc/nginx/nginx.conf 2>/dev/null || true
     sed -i '/data\/nginx\/stream/d' /etc/nginx/nginx.conf 2>/dev/null || true
     sed -i '/log-stream\.conf/d' /etc/nginx/nginx.conf 2>/dev/null || true
     # 清理旧 wrapper
@@ -358,6 +361,8 @@ clone_project() {
 
 install_node_deps() {
     section "安装 Node.js 依赖"
+    # 修复 npm 缓存目录权限 (root 运行遗留)
+    chown -R "$NPM_USER:$NPM_GROUP" "$NPM_DIR/.npm" 2>/dev/null || true
     # 使用上游原始 package.json (不修改源码)
     # config.js 未检测到 MySQL/Postgres 环境变量时自动使用 better-sqlite3
     cd "$NPM_DIR/backend"
@@ -375,6 +380,8 @@ build_frontend() {
     [[ "${SKIP_FRONTEND_BUILD:-}" == "1" ]] && {
         warn "跳过前端构建"; warn "需手动: cd $NPM_DIR/frontend && npm run build"; return 0
     }
+    # 修复 npm 缓存目录权限 (root 运行遗留)
+    chown -R "$NPM_USER:$NPM_GROUP" "$NPM_DIR/.npm" 2>/dev/null || true
     info "安装前端依赖 ..."
     su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/frontend' && npm install --no-audit --no-fund" &
     spinner $! "npm install (frontend)" || { error "前端依赖安装失败"; return 1; }
@@ -671,10 +678,19 @@ run_install() {
     confirm "确认安装？" "y" || exit 1
 
     spacer; header "执行安装"
-    install_dependencies; install_nodejs; create_user
-    clone_project; install_node_deps; build_frontend
-    create_data_dirs; configure_nginx; install_nginx_wrapper
-    save_env; create_systemd_service; configure_sudoers; create_logrotate
+    install_dependencies
+    install_nodejs
+    create_user
+    clone_project
+    install_node_deps || { error "后端依赖安装失败，请检查日志"; exit 1; }
+    build_frontend || { error "前端构建失败，安装中止"; exit 1; }
+    create_data_dirs
+    configure_nginx
+    install_nginx_wrapper
+    save_env
+    create_systemd_service
+    configure_sudoers
+    create_logrotate
     start_services
 
     spacer; header "安装完成"
@@ -769,6 +785,8 @@ upgrade_npm() {
     esac
 
     section "重新安装依赖"
+    # 修复 npm 缓存目录权限
+    chown -R "$NPM_USER:$NPM_GROUP" "$NPM_DIR/.npm" 2>/dev/null || true
     cd "$NPM_DIR/backend"
     su -s /bin/bash "$NPM_USER" -c "cd '$NPM_DIR/backend' && npm install --no-audit --no-fund" &
     spinner $! "npm install (backend)" || { error "后端依赖安装失败"; systemctl start npm-backend 2>/dev/null || true; return 1; }
