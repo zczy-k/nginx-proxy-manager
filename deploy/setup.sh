@@ -958,6 +958,9 @@ run_install() {
 
     spacer; header "安装完成"
     echo -e "  ${GREEN}✓${NC} 管理后台: ${CYAN}http://<IP>:${PORT_ADMIN}${NC}"
+    echo -e "  ${GREEN}✓${NC} HTTP 代理: ${CYAN}${PORT_HTTP}${NC}  HTTPS 代理: ${CYAN}${PORT_HTTPS}${NC}"
+    [[ "$PORT_HTTP" -ne 80 || "$PORT_HTTPS" -ne 443 ]] && \
+        echo -e "  ${DIM}  (自定义端口，用户访问域名时需附加端口号)${NC}"
     echo -e "  ${GREEN}✓${NC} 源码未修改 (可安全 merge 上游)"
     spacer
     echo -e "  ${DIM}bash deploy/setup.sh          # 管理菜单${NC}"
@@ -1078,15 +1081,15 @@ upgrade_npm() {
 health_check() {
     print_banner; load_env
     header "健康检查"
-    local pass=0 fail=0 total=7
+    local pass=0 fail=0 total=9
 
     # 1. systemd 服务
-    echo -n "  后端服务:    "
+    echo -n "  后端服务:      "
     if systemctl is-active npm-backend &>/dev/null; then echo -e "${GREEN}运行中${NC}"; pass=$((pass + 1))
     else echo -e "${RED}未运行${NC}"; fail=$((fail + 1)); fi
 
     # 2. Nginx
-    echo -n "  Nginx:       "
+    echo -n "  Nginx:         "
     if systemctl is-active nginx &>/dev/null; then echo -e "${GREEN}运行中${NC}"; pass=$((pass + 1))
     else echo -e "${RED}未运行${NC}"; fail=$((fail + 1)); fi
 
@@ -1096,27 +1099,37 @@ health_check() {
         echo -e "${GREEN}已安装${NC}"; pass=$((pass + 1))
     else echo -e "${RED}未安装${NC}"; fail=$((fail + 1)); fi
 
-    # 4. 管理端口
-    echo -n "  管理端口 $PORT_ADMIN: "
+    # 4. HTTP 代理端口
+    echo -n "  HTTP 端口 $PORT_HTTP:  "
+    if ss -tlnp "sport = :$PORT_HTTP" 2>/dev/null | grep -q LISTEN; then echo -e "${GREEN}监听中${NC}"; pass=$((pass + 1))
+    else echo -e "${RED}未监听${NC}"; fail=$((fail + 1)); fi
+
+    # 5. HTTPS 代理端口
+    echo -n "  HTTPS 端口 $PORT_HTTPS: "
+    if ss -tlnp "sport = :$PORT_HTTPS" 2>/dev/null | grep -q LISTEN; then echo -e "${GREEN}监听中${NC}"; pass=$((pass + 1))
+    else echo -e "${RED}未监听${NC}"; fail=$((fail + 1)); fi
+
+    # 6. 管理端口
+    echo -n "  管理端口 $PORT_ADMIN:  "
     if ss -tlnp "sport = :$PORT_ADMIN" 2>/dev/null | grep -q LISTEN; then echo -e "${GREEN}监听中${NC}"; pass=$((pass + 1))
     else echo -e "${RED}未监听${NC}"; fail=$((fail + 1)); fi
 
-    # 5. HTTP 响应
-    echo -n "  HTTP 响应:   "
+    # 7. HTTP 响应 (管理后台)
+    echo -n "  管理后台响应:  "
     local http_code
     http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT_ADMIN}/" 2>/dev/null) || http_code="000"
     if [[ "$http_code" == "200" ]]; then echo -e "${GREEN}200 OK${NC}"; pass=$((pass + 1))
     else echo -e "${RED}$http_code${NC}"; fail=$((fail + 1)); fi
 
-    # 6. SQLite
-    echo -n "  SQLite DB:   "
+    # 8. SQLite
+    echo -n "  SQLite DB:     "
     if [[ -f "$DATA_DIR/database.sqlite" ]]; then
         local size; size=$(du -sh "$DATA_DIR/database.sqlite" 2>/dev/null | cut -f1)
         echo -e "${GREEN}存在 ($size)${NC}"; pass=$((pass + 1))
     else echo -e "${YELLOW}不存在 (首次启动后创建)${NC}"; pass=$((pass + 1)); fi
 
-    # 7. Nginx 语法
-    echo -n "  Nginx 语法:  "
+    # 9. Nginx 语法
+    echo -n "  Nginx 语法:    "
     if nginx -t 2>/dev/null; then echo -e "${GREEN}通过${NC}"; pass=$((pass + 1))
     else echo -e "${RED}错误${NC}"; fail=$((fail + 1)); fi
 
