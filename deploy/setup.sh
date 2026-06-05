@@ -156,8 +156,13 @@ detect_arch() {
 detect_existing_npm() {
     local found=false
     [[ -d "$NPM_DIR" ]] && { found=true; warn "发现安装目录: $NPM_DIR"; }
-    systemctl is-enabled npm-backend &>/dev/null 2>&1 && { found=true; warn "发现 npm-backend 服务"; }
-    pgrep -f "node.*index.js" 2>/dev/null | grep -q "nginx-proxy-manager" && { found=true; warn "发现 NPM 进程"; }
+    [[ -f /etc/systemd/system/npm-backend.service ]] && { found=true; warn "发现 systemd 服务"; }
+    pgrep -f "node.*index.js" 2>/dev/null | grep -q "nginx-proxy-manager" && { found=true; warn "发现 NPM 后端进程"; }
+    [[ -d "$NGINX_CONF_DIR" ]] && { found=true; warn "发现 Nginx 配置: $NGINX_CONF_DIR"; }
+    [[ -f "$NGINX_DATA_DIR/custom/http_top.conf" ]] && { found=true; warn "发现 Nginx http 配置残留"; }
+    [[ -f /etc/nginx/npm-stream-fwd.conf ]] && { found=true; warn "发现 Stream 转发配置残留"; }
+    dpkg-divert --list 2>/dev/null | grep -q "/usr/sbin/nginx" && { found=true; warn "发现 Nginx Wrapper"; }
+    id -u "$NPM_USER" &>/dev/null && { found=true; warn "发现系统用户: $NPM_USER"; }
     $found
 }
 
@@ -265,33 +270,95 @@ configure_ports() {
 }
 
 cleanup_old_install() {
-    section "清理旧安装"
-    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qi "nginx-proxy-manager" && {
+    section "清理旧安装残留"
+    local cleaned=0
+
+    # 1. 停止所有 NPM 相关进程 (确保端口释放)
+    systemctl stop npm-backend 2>/dev/null || true
+    pkill -f "node.*nginx-proxy-manager/backend" 2>/dev/null || true
+    sleep 1
+
+    # 2. 清理 Docker 容器 (兼容从 Docker 迁移过来的用户)
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qi "nginx-proxy-manager"; then
         docker stop nginx-proxy-manager 2>/dev/null || true
         docker rm nginx-proxy-manager 2>/dev/null || true
-        log "已清理 Docker 容器"
-    }
-    [[ -f /etc/systemd/system/npm-backend.service ]] && {
-        systemctl stop npm-backend 2>/dev/null || true
-        systemctl disable npm-backend 2>/dev/null || true
+        log "已清理 Docker 容器"; cleaned=$((cleaned + 1))
+    fi
+
+    # 3. 清理 systemd 服务及关联文件 (不再以服务文件存在为条件)
+    systemctl disable npm-backend 2>/dev/null || true
+    if [[ -f /etc/systemd/system/npm-backend.service ]]; then
         rm -f /etc/systemd/system/npm-backend.service
+        cleaned=$((cleaned + 1))
+    fi
+    if [[ -f /etc/sudoers.d/npm-backend ]]; then
         rm -f /etc/sudoers.d/npm-backend 2>/dev/null || true
+    fi
+    if [[ -f /etc/logrotate.d/nginx-proxy-manager ]]; then
         rm -f /etc/logrotate.d/nginx-proxy-manager 2>/dev/null || true
-        systemctl daemon-reload; log "已清理 systemd 服务"
-    }
-    [[ -d "$NGINX_CONF_DIR" ]] && { rm -rf "$NGINX_CONF_DIR"; log "已清理 Nginx 配置"; }
-    [[ -d /etc/nginx/conf.d/include ]] && { rm -rf /etc/nginx/conf.d/include; log "已清理 Nginx include 片段"; }
-    # 清理 nginx.conf 中残余的 NPM include 注入
-    sed -i '/npm-conf\.d/d' /etc/nginx/nginx.conf 2>/dev/null || true
-    sed -i '/http_top\.conf/d' /etc/nginx/nginx.conf 2>/dev/null || true
-    sed -i '/data\/nginx\/stream/d' /etc/nginx/nginx.conf 2>/dev/null || true
-    sed -i '/npm-stream-fwd/d' /etc/nginx/nginx.conf 2>/dev/null || true
+    fi
+    systemctl daemon-reload 2>/dev/null || true
+
+    # 4. 清理 NPM Nginx 配置目录 (含旧版放在此处的 stream 文件)
+    if [[ -d "$NGINX_CONF_DIR" ]]; then
+        rm -rf "$NGINX_CONF_DIR"
+        cleaned=$((cleaned + 1))
+    fi
+
+    # 5. 清理 Docker 遗留的 nginx include 片段
+    if [[ -d /etc/nginx/conf.d/include ]]; then
+        rm -rf /etc/nginx/conf.d/include
+        cleaned=$((cleaned + 1))
+    fi
+
+    # 6. 清理 Stream 转发配置 (正确路径 + 旧版错误路径)
     rm -f /etc/nginx/npm-stream-fwd.conf 2>/dev/null || true
-    # 清理旧 wrapper
-    dpkg-divert --list 2>/dev/null | grep -q "/usr/sbin/nginx" && {
-        rm -f /usr/sbin/nginx; dpkg-divert --remove --rename /usr/sbin/nginx 2>/dev/null || true
-        log "已清理旧 Nginx wrapper"
-    }
+
+    # 7. 清理 nginx.conf 中所有 NPM 注入行 (覆盖所有历史版本模式)
+    local nc="/etc/nginx/nginx.conf"
+    if [[ -f "$nc" ]]; then
+        sed -i '/npm-conf\.d/d' "$nc" 2>/dev/null || true
+        sed -i '/http_top\.conf/d' "$nc" 2>/dev/null || true
+        sed -i '/data\/nginx\/stream/d' "$nc" 2>/dev/null || true
+        sed -i '/npm-stream-fwd/d' "$nc" 2>/dev/null || true
+        # 历史版本残留模式
+        sed -i '/log-stream\.conf/d' "$nc" 2>/dev/null || true
+        sed -i '/conf\.d\/npm-\*\.conf/d' "$nc" 2>/dev/null || true
+        sed -i '/conf\.d\/include/d' "$nc" 2>/dev/null || true
+    fi
+
+    # 8. 清理 nginx.conf 精确回滚备份文件
+    rm -f /etc/nginx/nginx.conf.npm-bak.* 2>/dev/null || true
+
+    # 9. 清理 NPM 创建的 Nginx 缓存目录
+    rm -rf /var/lib/nginx/cache/public 2>/dev/null || true
+    rm -rf /var/lib/nginx/cache/private 2>/dev/null || true
+
+    # 10. 清理 NPM 日志目录
+    if [[ -d "$LOG_DIR" ]]; then
+        rm -rf "$LOG_DIR"
+        cleaned=$((cleaned + 1))
+    fi
+
+    # 11. 清理 NPM 默认站点和 http 级配置 (不含用户代理配置)
+    rm -f "$NGINX_DATA_DIR/default_host/site.conf" 2>/dev/null || true
+    rm -f "$NGINX_DATA_DIR/custom/http_top.conf" 2>/dev/null || true
+
+    # 12. 清理 nginx wrapper (dpkg-divert)
+    if dpkg-divert --list 2>/dev/null | grep -q "/usr/sbin/nginx"; then
+        rm -f /usr/sbin/nginx
+        dpkg-divert --remove --rename /usr/sbin/nginx 2>/dev/null || true
+        log "已清理 Nginx Wrapper"; cleaned=$((cleaned + 1))
+    fi
+
+    # 13. 重载 nginx 使清理生效
+    systemctl reload nginx 2>/dev/null || true
+
+    if [[ $cleaned -gt 0 ]]; then
+        log "旧安装残留清理完成 ($cleaned 项)"
+    else
+        info "未发现需要清理的残留"
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -1017,23 +1084,54 @@ uninstall_npm() {
 }
 
 _uninstall_common() {
+    # 停止服务
     systemctl stop npm-backend 2>/dev/null || true
     systemctl disable npm-backend 2>/dev/null || true
+    pkill -f "node.*nginx-proxy-manager/backend" 2>/dev/null || true
+    sleep 1
+
+    # 移除服务文件
     rm -f /etc/systemd/system/npm-backend.service
     rm -f /etc/sudoers.d/npm-backend 2>/dev/null || true
     rm -f /etc/logrotate.d/nginx-proxy-manager 2>/dev/null || true
     systemctl daemon-reload
+
+    # 清理 Nginx 配置
     [[ -d "$NGINX_CONF_DIR" ]] && rm -rf "$NGINX_CONF_DIR"
-    sed -i '/npm-conf\.d/d' /etc/nginx/nginx.conf 2>/dev/null || true
-    sed -i '/http_top\.conf/d' /etc/nginx/nginx.conf 2>/dev/null || true
-    sed -i '/data\/nginx\/stream/d' /etc/nginx/nginx.conf 2>/dev/null || true
-    sed -i '/npm-stream-fwd/d' /etc/nginx/nginx.conf 2>/dev/null || true
-    rm -f /etc/nginx/npm-stream-fwd.conf 2>/dev/null || true
     [[ -d /etc/nginx/conf.d/include ]] && rm -rf /etc/nginx/conf.d/include
+
+    # 清理 nginx.conf 注入 (含历史版本模式)
+    local nc="/etc/nginx/nginx.conf"
+    if [[ -f "$nc" ]]; then
+        sed -i '/npm-conf\.d/d' "$nc" 2>/dev/null || true
+        sed -i '/http_top\.conf/d' "$nc" 2>/dev/null || true
+        sed -i '/data\/nginx\/stream/d' "$nc" 2>/dev/null || true
+        sed -i '/npm-stream-fwd/d' "$nc" 2>/dev/null || true
+        sed -i '/log-stream\.conf/d' "$nc" 2>/dev/null || true
+        sed -i '/conf\.d\/npm-\*\.conf/d' "$nc" 2>/dev/null || true
+        sed -i '/conf\.d\/include/d' "$nc" 2>/dev/null || true
+    fi
+
+    # 清理独立配置文件
+    rm -f /etc/nginx/npm-stream-fwd.conf 2>/dev/null || true
+    rm -f /etc/nginx/nginx.conf.npm-bak.* 2>/dev/null || true
+
+    # 清理 Nginx 缓存
+    rm -rf /var/lib/nginx/cache/public 2>/dev/null || true
+    rm -rf /var/lib/nginx/cache/private 2>/dev/null || true
+
+    # 清理 NPM 默认站点和 http 配置
+    rm -f "$NGINX_DATA_DIR/default_host/site.conf" 2>/dev/null || true
+    rm -f "$NGINX_DATA_DIR/custom/http_top.conf" 2>/dev/null || true
+
+    # 清理 nginx wrapper
+    if dpkg-divert --list 2>/dev/null | grep -q "/usr/sbin/nginx"; then
+        rm -f /usr/sbin/nginx
+        dpkg-divert --remove --rename /usr/sbin/nginx 2>/dev/null || true
+    fi
+
+    # 重载 nginx
     systemctl reload nginx 2>/dev/null || true
-    dpkg-divert --list 2>/dev/null | grep -q "/usr/sbin/nginx" && {
-        rm -f /usr/sbin/nginx; dpkg-divert --remove --rename /usr/sbin/nginx 2>/dev/null || true
-    }
 }
 
 _uninstall_keep() {
