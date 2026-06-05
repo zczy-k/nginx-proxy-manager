@@ -49,7 +49,7 @@ NPM 设计为可以与服务器上的其他服务（如其他网站、隧道、A
 - `proxy_cache_path` — NPM 专属缓存路径 (位于 `/var/lib/nginx/cache/`)
 - `map $host $forward_scheme` 等 3 个 map — NPM 代理模板依赖
 
-**端口冲突处理流程:** 安装时如检测到端口被占用，NPM 会循环提示用户修改端口直到无冲突为止，绝不会自动停止其他服务。
+**端口冲突处理流程:** 安装时如检测到管理端口被占用，NPM 会循环提示用户修改端口直到无冲突为止，绝不会自动停止其他服务。
 
 **唯一的冲突风险:** 如果你的 nginx.conf 中也定义了 `map $host $forward_scheme`、`map $http_x_forwarded_proto $x_forwarded_proto` 或 `map $http_x_forwarded_scheme $x_forwarded_scheme`，需要移除你的定义，NPM 的 map 会自动处理。安装脚本会检测并警告此冲突。
 
@@ -63,7 +63,7 @@ NPM 设计为可以与服务器上的其他服务（如其他网站、隧道、A
 
 ### 后端端口
 
-后端固定监听 3000 端口 (源码硬编码)。管理面板通过 Nginx 反向代理连接到 `127.0.0.1:3000`。HTTP/HTTPS 代理端口可自定义。
+后端固定监听 3000 端口 (源码硬编码)。管理面板通过 Nginx 反向代理连接到 `127.0.0.1:3000`。HTTP/HTTPS 代理端口由后端模板固定为 80/443 (不修改源码)，管理面板端口可自定义 (默认 81)。
 
 ### 数据隔离
 
