@@ -26,8 +26,8 @@ jobs:
           node-version: "22"
           cache: "npm"
           cache-dependency-path: |
-            backend/package-lock.json
-            frontend/package-lock.json
+            backend/yarn.lock
+            frontend/yarn.lock
 
       # ─── 前端构建 ──────────────────────────────────────
       - name: Install frontend dependencies
@@ -62,15 +62,12 @@ jobs:
 
       - name: Create build metadata
         run: |
-          cat > build-info.json << EOF
-          {
-            "commit": "${{ github.sha }}",
-            "branch": "${{ github.ref_name }}",
-            "node_version": "$(node --version)",
-            "build_time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "runner": "ubuntu-latest"
-          }
-          EOF
+          printf '{\n  "commit": "%s",\n  "branch": "%s",\n  "node_version": "%s",\n  "build_time": "%s",\n  "runner": "ubuntu-latest"\n}\n' \
+            "${{ github.sha }}" \
+            "${{ github.ref_name }}" \
+            "$(node --version)" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > build-info.json
           cat build-info.json
 
       # ─── 发布 ──────────────────────────────────────────
