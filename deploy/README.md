@@ -1,33 +1,52 @@
 # Nginx Proxy Manager - 裸机部署工具
 
-位于 `deploy/` 目录，提供无需 Docker 的部署方案。
+无需 Docker，直接使用系统 Nginx + Node.js 部署 NPM。
 
 ## 快速开始
 
-**一行命令（推荐）：**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zczy-k/nginx-proxy-manager/develop/deploy/setup.sh | sudo bash
 ```
 
-或者无需 sudo 前缀（脚本会自动提权）：
-```bash
-curl -fsSL https://raw.githubusercontent.com/zczy-k/nginx-proxy-manager/develop/deploy/setup.sh | bash
-```
+或先克隆再运行：
 
-或者使用 git clone：
 ```bash
 git clone --depth 1 https://github.com/zczy-k/nginx-proxy-manager.git /opt/nginx-proxy-manager
 sudo bash /opt/nginx-proxy-manager/deploy/setup.sh
 ```
 
-> 运行后直接进入交互式菜单，所有操作通过数字选择完成。
+## 设计原则
 
-## 特性
+- **不修改上游源码** — 通过 Nginx Wrapper (dpkg-divert) + 运行时配置实现适配
+- **可安全 merge 上游更新** — fork 中的 deploy/ 目录独立于上游代码
+- **资源节约** — 2C1G 服务器 ~150MB，为 Docker 版的 1/3
 
-- **零 Docker** — 直接使用系统 Nginx + Node.js
-- **端口自定义** — 安装时自定义 HTTP/HTTPS/管理/后端端口
-- **隔离安装** — 独立 Nginx 配置目录，不干扰其他站点
-- **健康检查** — 安装后自动检查服务/端口/HTTP/数据库状态
-- **升级管理** — 支持从 origin 和上游官方仓库升级
-- **完整卸载** — 保留数据 / 完全清除 双模式
-- **资源节约** — 2C1G 服务器 ~150MB 内存，仅为 Docker 版的 1/3
+## 功能
+
+| 命令 | 说明 |
+|------|------|
+| `bash deploy/setup.sh` | 交互式菜单 |
+| `bash deploy/setup.sh install` | 安装 |
+| `bash deploy/setup.sh uninstall` | 卸载 (保留数据/完全清除) |
+| `bash deploy/setup.sh upgrade` | 升级 (从 origin 或 upstream) |
+| `bash deploy/setup.sh health` | 健康检查 (7 项检测) |
+| `bash deploy/setup.sh status` | 查看状态 |
+
+## 技术细节
+
+### Nginx Wrapper
+
+上游 `internal/nginx.js` 直接调用 `/usr/sbin/nginx` (不带 sudo)。Docker 中后端以 root 运行无问题，裸机以 npm 用户运行则权限不足。
+
+解决: 通过 `dpkg-divert` 将原始 nginx 转移到 `nginx.real`，在原位置放置 wrapper 脚本。apt 升级 nginx 时不会覆盖 wrapper。
+
+### 后端端口
+
+后端固定监听 3000 端口 (源码硬编码)。管理面板通过 Nginx 反向代理连接到 `127.0.0.1:3000`。HTTP/HTTPS 代理端口可自定义。
+
+### 数据隔离
+
+- 安装目录: `/opt/nginx-proxy-manager`
+- 数据目录: `/data/npm` (数据库、keys)
+- Nginx 数据: `/data/nginx` (代理配置、日志、证书)
+- Nginx 配置: `/etc/nginx/npm-conf.d` (隔离目录)
