@@ -2,7 +2,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="4.0.0"
+SCRIPT_VERSION="4.0.1"
 APP_LABEL="Nginx Proxy Manager Bare Metal"
 APP_USER="npmbare"
 APP_GROUP="npmbare"
@@ -312,6 +312,12 @@ ensure_user() {
     if ! id -u "$APP_USER" >/dev/null 2>&1; then
         useradd --system --gid "$APP_GROUP" --home-dir "$APP_HOME" --shell /usr/sbin/nologin "$APP_USER"
     fi
+
+    # Keep the top-level roots managed by root, but allow the service account to
+    # traverse them so it can reach its private runtimes under /opt and /var/lib.
+    chown root:"$APP_GROUP" "$INSTALL_ROOT" "$STATE_ROOT"
+    chmod 750 "$INSTALL_ROOT" "$STATE_ROOT"
+
     chown -R "$APP_USER:$APP_GROUP" "$APP_HOME" "$LOG_ROOT" "$TMP_ROOT" "$APP_ROOT"
 }
 
@@ -380,7 +386,7 @@ ensure_certbot() {
         python3 -m venv "$CERTBOT_VENV"
     fi
     chown -R "$APP_USER:$APP_GROUP" "$CERTBOT_VENV"
-    run_as_app "'$CERTBOT_VENV/bin/pip' install --upgrade pip certbot certbot-nginx >/dev/null"
+    run_as_app "'$CERTBOT_VENV/bin/python' -m pip install --upgrade pip certbot certbot-nginx >/dev/null"
     log "Certbot environment is ready"
 }
 
@@ -595,7 +601,7 @@ write_runtime_files() {
     mkdir -p "$RUNTIME_DATA_DIR/nginx"/{access,custom_ssl,default_host,default_www,dead_host,proxy_host,redirection_host,stream,temp,custom}
     mkdir -p "$RUNTIME_DATA_DIR"/{logs,access,custom_ssl,letsencrypt-acme-challenge}
     mkdir -p "$RUNTIME_LE_DIR"/{accounts,archive,credentials,live,renewal}
-    mkdir -p "$RUNTIME_ETC_DIR/logrotate.d" "$RUNTIME_NGINX_ETC_DIR/conf.d/include" "$RUNTIME_RUN_DIR" "$RUNTIME_RUN_DIR/cache/public" "$RUNTIME_RUN_DIR/cache/private" "$TMP_ROOT"
+    mkdir -p "$RUNTIME_ETC_DIR/logrotate.d" "$RUNTIME_NGINX_ETC_DIR/conf.d/include" "$RUNTIME_RUN_DIR" "$RUNTIME_RUN_DIR/cache/public" "$RUNTIME_RUN_DIR/cache/private" "$RUNTIME_RUN_DIR/tmp/nginx/body" "$TMP_ROOT"
 
     rm -rf "$LOG_ROOT"
     ln -s "$RUNTIME_DATA_DIR/logs" "$LOG_ROOT"
@@ -674,7 +680,7 @@ http {
     server_tokens off;
     tcp_nopush on;
     tcp_nodelay on;
-    client_body_temp_path /tmp/nginx/body 1 2;
+    client_body_temp_path /run/npm-bare/tmp/nginx/body 1 2;
     keepalive_timeout 90s;
     proxy_connect_timeout 90s;
     proxy_send_timeout 90s;
