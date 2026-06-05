@@ -495,7 +495,10 @@ create_data_dirs() {
     mkdir -p /data/letsencrypt-acme-challenge
     mkdir -p "$NGINX_DATA_DIR"/{custom,proxy_host,redirection_host,stream,dead_host,temp,default_host}
     chown "$NPM_USER:$NPM_GROUP" /data/logs /data/custom_ssl /data/access /data/letsencrypt-acme-challenge
-    chown -R "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR" "$DATA_DIR" "$LOG_DIR"
+    chown -R "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR" "$DATA_DIR"
+    # 日志目录: npm 后端和 nginx worker (www-data) 都需要写入
+    chown "$NPM_USER:www-data" "$LOG_DIR"
+    chmod 775 "$LOG_DIR"
     # Let's Encrypt (certbot 需要完整目录权限)
     mkdir -p /etc/letsencrypt/credentials /etc/letsencrypt/live /etc/letsencrypt/archive /etc/letsencrypt/renewal /etc/letsencrypt/accounts
     chown -R "$NPM_USER:$NPM_GROUP" /etc/letsencrypt 2>/dev/null || true
@@ -565,6 +568,13 @@ server {
     }
 }
 NGINX_CONF
+
+    # 复制 Docker fallback server (定义 $server/$forward_scheme/$port 变量)
+    # log_format 和 proxy.conf 引用这些变量，没有 fallback 会导致 unknown variable 错误
+    local docker_default="$NPM_DIR/docker/rootfs/etc/nginx/conf.d/default.conf"
+    if [[ -f "$docker_default" ]]; then
+        cp "$docker_default" "$NGINX_CONF_DIR/npm-default.conf"
+    fi
 
     # NPM http 级配置 (map / cache / log_format)
     cat > "$NGINX_DATA_DIR/custom/http_top.conf" << 'HTTP_TOP'
