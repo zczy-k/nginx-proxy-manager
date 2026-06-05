@@ -817,19 +817,58 @@ EOF
     # ─── 自定义端口转发 (stream 块) ──────────────────────────────
     # 后端模板硬编码 listen 80 / listen 443，不修改源码
     # 当用户自定义端口时，通过 stream {} 透明转发到内部 80/443
-    # 注意: stream 文件必须放在 npm-conf.d 之外，因为 npm-conf.d 被 http {} include
+    # 关键: 如果 nginx.conf 已有 stream {} 块，server 注入到已有块内;
+    #       如果无，创建独立的 stream {} 文件。nginx 不允许重复的 stream 指令。
     local stream_fwd="/etc/nginx/npm-stream-fwd.conf"
-    rm -f "$stream_fwd"  # 清理旧配置
-    # 也清理旧版可能留在 npm-conf.d 内的文件
-    rm -f "$NGINX_CONF_DIR/npm-stream-fwd.conf"
+    rm -f "$stream_fwd"
+    rm -f "$NGINX_CONF_DIR/npm-stream-fwd.conf"  # 旧版错误路径
+
     if [[ "$PORT_HTTP" -ne 80 || "$PORT_HTTPS" -ne 443 ]]; then
-        cat > "$stream_fwd" << STREAM_FWD
+        local has_existing_stream=false
+        grep -qE '^\s*stream\s*\{' /etc/nginx/nginx.conf 2>/dev/null && has_existing_stream=true
+
+        if $has_existing_stream; then
+            # A. nginx.conf 已有 stream {} → 生成无 stream 包装的 server 块，注入到已有块内
+            cat > "$stream_fwd" << 'STREAM_HEAD'
+# NPM 自定义端口转发 (由 setup.sh 自动生成)
+STREAM_HEAD
+            if [[ "$PORT_HTTPS" -ne 443 ]]; then
+                cat >> "$stream_fwd" << STREAM_BODY
+    map \$ssl_preread_server_name \$npm_fwd_https {
+        default 127.0.0.1:443;
+    }
+    server {
+        listen ${PORT_HTTPS};
+        listen [::]:${PORT_HTTPS};
+        proxy_pass \$npm_fwd_https;
+        ssl_preread on;
+    }
+STREAM_BODY
+            fi
+            if [[ "$PORT_HTTP" -ne 80 ]]; then
+                cat >> "$stream_fwd" << STREAM_BODY
+    server {
+        listen ${PORT_HTTP};
+        listen [::]:${PORT_HTTP};
+        proxy_pass 127.0.0.1:80;
+    }
+STREAM_BODY
+            fi
+            chown "$NPM_USER:$NPM_GROUP" "$stream_fwd"
+
+            if ! grep -q 'npm-stream-fwd' "$nc" 2>/dev/null; then
+                sed -i '/^\s*stream\s*{/a\    include /etc/nginx/npm-stream-fwd.conf;' "$nc"
+                log "已注入 stream 端口转发到已有 stream 块 ($PORT_HTTP→80, $PORT_HTTPS→443)"
+            fi
+        else
+            # B. nginx.conf 无 stream {} → 创建含 stream {} 包装的独立文件
+            cat > "$stream_fwd" << STREAM_FWD
 # NPM 自定义端口转发 (由 setup.sh 自动生成)
 # 将用户自定义端口的流量透明转发到 nginx 内部 80/443
 stream {
 STREAM_FWD
-        if [[ "$PORT_HTTPS" -ne 443 ]]; then
-            cat >> "$stream_fwd" << STREAM_FWD
+            if [[ "$PORT_HTTPS" -ne 443 ]]; then
+                cat >> "$stream_fwd" << STREAM_FWD
     map \$ssl_preread_server_name \$npm_fwd_https {
         default 127.0.0.1:443;
     }
@@ -840,25 +879,23 @@ STREAM_FWD
         ssl_preread on;
     }
 STREAM_FWD
-        fi
-        if [[ "$PORT_HTTP" -ne 80 ]]; then
-            cat >> "$stream_fwd" << STREAM_FWD
+            fi
+            if [[ "$PORT_HTTP" -ne 80 ]]; then
+                cat >> "$stream_fwd" << STREAM_FWD
     server {
         listen ${PORT_HTTP};
         listen [::]:${PORT_HTTP};
         proxy_pass 127.0.0.1:80;
     }
 STREAM_FWD
-        fi
-        echo "}" >> "$stream_fwd"
-        chown "$NPM_USER:$NPM_GROUP" "$stream_fwd"
+            fi
+            echo "}" >> "$stream_fwd"
+            chown "$NPM_USER:$NPM_GROUP" "$stream_fwd"
 
-        # 在 nginx.conf 顶层注入 stream include (如果尚未存在)
-        local nc2="/etc/nginx/nginx.conf"
-        if [[ -f "$nc2" ]] && ! grep -q 'npm-stream-fwd' "$nc2" 2>/dev/null; then
-            # 追加到文件末尾 (stream {} 块必须出现在顶层，不能在 http/events 块内)
-            echo 'include /etc/nginx/npm-stream-fwd.conf;' >> "$nc2"
-            log "已注入 stream 端口转发 ($PORT_HTTP→80, $PORT_HTTPS→443)"
+            if ! grep -q 'npm-stream-fwd' "$nc" 2>/dev/null; then
+                echo 'include /etc/nginx/npm-stream-fwd.conf;' >> "$nc"
+                log "已注入 stream 端口转发 ($PORT_HTTP→80, $PORT_HTTPS→443)"
+            fi
         fi
     else
         # 默认端口，清理可能残留的 stream include 和文件
