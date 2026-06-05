@@ -591,14 +591,10 @@ include /data/nginx/temp/*.conf;
 HTTP_TOP
     chown "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR/custom/http_top.conf"
 
-    # 禁用 Ubuntu 默认站点，避免与 NPM 配置冲突 (default_server 冲突)
-    if [[ -f /etc/nginx/sites-enabled/default ]]; then
-        rm -f /etc/nginx/sites-enabled/default
-        log "已禁用 Ubuntu 默认站点 (sites-enabled/default)"
-    fi
-
-    # 默认站点 (不加 default_server，由用户自定义或 NPM 后端生成)
-    if [[ ! -f "$NGINX_DATA_DIR/default_host/site.conf" ]]; then
+    # 默认站点 (仅当 sites-enabled 为空时创建，避免与用户已有站点冲突)
+    local sites_count=0
+    [[ -d /etc/nginx/sites-enabled ]] && sites_count=$(ls -1 /etc/nginx/sites-enabled/ 2>/dev/null | wc -l)
+    if [[ "$sites_count" -eq 0 ]] && [[ ! -f "$NGINX_DATA_DIR/default_host/site.conf" ]]; then
         cat > "$NGINX_DATA_DIR/default_host/site.conf" << 'EOF'
 server {
     listen 80;
@@ -609,12 +605,15 @@ server {
 }
 EOF
         chown "$NPM_USER:$NPM_GROUP" "$NGINX_DATA_DIR/default_host/site.conf"
-    else
+        log "已创建 NPM 默认站点"
+    elif [[ -f "$NGINX_DATA_DIR/default_host/site.conf" ]]; then
         # 修正旧版本遗留的 default_server (会导致 nginx -t 失败)
         if grep -q 'default_server' "$NGINX_DATA_DIR/default_host/site.conf" 2>/dev/null; then
             sed -i 's/ default_server//g' "$NGINX_DATA_DIR/default_host/site.conf"
             log "已移除 default_host/site.conf 中的 default_server"
         fi
+    else
+        info "sites-enabled 已有 $sites_count 个站点，跳过 NPM 默认站点创建"
     fi
 
     # 复制 Docker 内置的 nginx include 片段 (conf.d/include/*.conf)
@@ -641,32 +640,58 @@ EOF
     # 注入 include (兼容不同 nginx.conf 格式)
     local nc="/etc/nginx/nginx.conf"
     if [[ -f "$nc" ]]; then
+        # http 块注入: 在 http {} 末尾 (最后一个 } 之前) 追加 include
         if ! grep -q "npm-conf.d" "$nc" 2>/dev/null; then
             if grep -qE '^\s*http\s*\{' "$nc"; then
-                sed -i '/^\s*http\s*{/a\    include /etc/nginx/npm-conf.d/*.conf;' "$nc"
-                sed -i '/^\s*http\s*{/a\    include /data/nginx/custom/http_top.conf;' "$nc"
-                log "已注入 NPM http include"
+                # 使用 awk + 花括号计数精确定位 http {} 结束位置
+                awk '
+                /^\s*http\s*\{/ { in_http=1; depth=0 }
+                in_http {
+                    depth += gsub(/{/, "{")
+                    depth -= gsub(/}/, "}")
+                    if (depth <= 0) {
+                        print "    include /data/nginx/custom/http_top.conf;"
+                        print "    include /etc/nginx/npm-conf.d/*.conf;"
+                        in_http = 0
+                    }
+                }
+                { print }
+                ' "$nc" > "${nc}.tmp" && mv "${nc}.tmp" "$nc"
+                log "已注入 NPM http include (http 块末尾)"
             else
                 warn "未找到 http {} 块，请手动添加 include 指令"
             fi
         fi
-        # stream 块 (TCP/UDP 代理)
+        # stream 块: 仅在 stream 块存在且没有自定义 server 时才注入
+        # (已有自定义 stream 配置的服务器不应被修改)
         if ! grep -q '/data/nginx/stream' "$nc" 2>/dev/null; then
             if grep -qE '^\s*stream\s*\{' "$nc"; then
-                sed -i '/^\s*stream\s*{/a\    include /data/nginx/stream/*.conf;' "$nc"
-                sed -i '/^\s*stream\s*{/a\    include /etc/nginx/conf.d/include/log-stream.conf;' "$nc"
-                log "已注入 NPM stream include"
+                local stream_server_count
+                stream_server_count=$(sed -n '/^\s*stream\s*{/,/^}/p' "$nc" | grep -c '^\s*server\s*{' || true)
+                if [[ "$stream_server_count" -eq 0 ]]; then
+                    sed -i '/^\s*stream\s*{/a\    include /data/nginx/stream/*.conf;' "$nc"
+                    log "已注入 NPM stream include"
+                else
+                    info "stream 块已有 $stream_server_count 个自定义 server，跳过注入"
+                    info "如需 NPM TCP/UDP 代理，请手动添加: include /data/nginx/stream/*.conf;"
+                fi
             else
                 info "nginx.conf 无 stream 块 (跳过 TCP/UDP 代理支持)"
             fi
         fi
     fi
 
-    nginx -t 2>/dev/null && { systemctl reload nginx; log "Nginx 配置生效"; } || {
+    # nginx 配置测试 (显示完整错误信息便于排查)
+    local nginx_test_output
+    if nginx_test_output=$(nginx -t 2>&1); then
+        systemctl reload nginx
+        log "Nginx 配置生效"
+    else
         warn "配置测试失败，恢复备份..."
+        echo "$nginx_test_output" | while IFS= read -r line; do warn "  $line"; done
         [[ -d "$BACKUP_DIR/nginx-backup" ]] && cp -r "$BACKUP_DIR/nginx-backup"/* /etc/nginx/
         systemctl reload nginx 2>/dev/null || true
-    }
+    fi
 }
 
 create_systemd_service() {
